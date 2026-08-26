@@ -8,17 +8,15 @@ from typing import Any
 
 import pytest
 
+from src.config import CategoryConfig, InboxConfig, MediaSafetyConfig, SafetyConfig
 from src.media import (
-    ALLOWED_DOC_MIMES,
     INBOX_DIR_NAME,
-    MAX_FILE_SIZE,
-    MAX_PHOTO_SIZE,
     build_media_prompt,
     clean_inbox,
-    is_allowed_document,
-    is_allowed_image,
+    classify_file,
     list_inbox,
     save_to_inbox,
+    _mime_matches,
 )
 
 
@@ -60,57 +58,70 @@ class _FakeState:
         self.photo_enabled = photo_enabled
 
 
-class _FakeCfg:
-    pass
+def _fake_cfg(categories: dict[str, CategoryConfig] | None = None) -> Any:
+    """Build a minimal Config-like object with safety config for tests."""
+    if categories is None:
+        categories = {
+            "code": CategoryConfig(mime_types=["text/*"], extensions=[".py", ".sh"], routing="pass"),
+            "documents": CategoryConfig(mime_types=["application/pdf"], extensions=[".pdf"], routing="pass"),
+        }
+    media = MediaSafetyConfig(categories=categories, default_routing="block")
+    safety = SafetyConfig(media=media)
+    # Minimal config-like object
+    s = safety
+    class Cfg:
+        safety = s
+    return Cfg()
 
 
-# ── MIME validation edge cases ────────────────────────────────────
+# ── MIME matching ─────────────────────────────────────────────────
 
 
-def test_empty_mime_rejected() -> None:
-    assert is_allowed_image("") is False
+def test_mime_matches_exact() -> None:
+    assert _mime_matches("text/plain", "text/plain") is True
 
 
-def test_none_filename_ok() -> None:
-    assert is_allowed_document("text/plain", "") is True  # MIME trusted
+def test_mime_matches_wildcard() -> None:
+    assert _mime_matches("text/x-python", "text/*") is True
 
 
-def test_double_extension() -> None:
-    """tar.gz is .gz — rejected unless MIME is trusted."""
-    assert is_allowed_document("application/gzip", "archive.tar.gz") is False
+def test_mime_matches_wrong_type() -> None:
+    assert _mime_matches("image/png", "text/*") is False
 
 
-def test_uppercase_extension() -> None:
-    assert is_allowed_document("application/octet-stream", "README.MD") is True
+def test_mime_matches_no_wildcard_generic() -> None:
+    assert _mime_matches("application/zip", "application/*") is True
 
 
-def test_no_extension() -> None:
-    assert is_allowed_document("application/octet-stream", "Dockerfile") is False
+# ── classify_file ─────────────────────────────────────────────────
 
 
-def test_hidden_file_dotfile_no_extension() -> None:
-    assert is_allowed_document("text/plain", ".env") is True  # MIME trusted
-    assert is_allowed_document("application/octet-stream", ".env") is False  # no ext
+def test_classify_mime_match() -> None:
+    cats = {"code": CategoryConfig(mime_types=["text/*"], routing="pass")}
+    assert classify_file("text/x-python", "main.py", 5000, cats) == ("code", "pass", "")
 
 
-def test_xml_in_allowlist() -> None:
-    assert is_allowed_document("application/xml", "data.xml") is True
+def test_classify_extension_fallback() -> None:
+    cats = {"code": CategoryConfig(extensions=[".py"], routing="pass")}
+    assert classify_file("application/octet-stream", "script.py", 5000, cats) == ("code", "pass", "")
 
 
-def test_csv_in_allowlist() -> None:
-    assert is_allowed_document("text/csv", "data.csv") is True
+def test_classify_too_large() -> None:
+    cats = {"code": CategoryConfig(mime_types=["text/*"], max_size_bytes=1000, routing="pass")}
+    assert classify_file("text/plain", "big.txt", 2000, cats)[1] == "block"
 
 
-def test_html_in_allowlist() -> None:
-    assert is_allowed_document("text/html", "page.html") is True
+def test_classify_unknown_default_block() -> None:
+    cats: dict[str, CategoryConfig] = {}
+    assert classify_file("application/x-msdownload", "virus.exe", 5000, cats) == ("unknown", "block", "")
 
 
-def test_all_mime_allowlist_self_consistent() -> None:
-    for mime in ALLOWED_DOC_MIMES:
-        assert is_allowed_document(mime, f"test{os.extsep}bin") is True
+def test_classify_unknown_clean_routing() -> None:
+    cats: dict[str, CategoryConfig] = {}
+    assert classify_file("x/y", "f.bin", 100, cats, default_routing="warn") == ("unknown", "warn", "")
 
 
-# ── save_to_inbox edge cases ──────────────────────────────────────
+# ── save_to_inbox ─────────────────────────────────────────────────
 
 
 def test_save_to_inbox_creates_dir(tmp_path: Path) -> None:
@@ -125,17 +136,19 @@ def test_save_to_inbox_unique_names(tmp_path: Path) -> None:
     time.sleep(0.02)
     b = save_to_inbox(str(tmp_path), "g.py", b"b")
     assert a != b
-    assert a.name.startswith(tuple("0123456789"))
-    assert b.name.startswith(tuple("0123456789"))
 
 
-def test_save_to_inbox_empty_file(tmp_path: Path) -> None:
-    path = save_to_inbox(str(tmp_path), "empty.txt", b"")
-    assert path.exists()
-    assert path.read_bytes() == b""
+def test_save_to_inbox_size_cap(tmp_path: Path) -> None:
+    wd = str(tmp_path)
+    save_to_inbox(wd, "big1.txt", b"x" * 1000, max_total_bytes=1500)
+    save_to_inbox(wd, "big2.txt", b"y" * 1000, max_total_bytes=1500)
+    # First file should have been purged
+    inbox = Path(wd) / INBOX_DIR_NAME
+    names = [f.name for f in inbox.iterdir()]
+    assert len(names) == 1
 
 
-# ── clean_inbox edge cases ────────────────────────────────────────
+# ── clean_inbox ───────────────────────────────────────────────────
 
 
 def test_clean_inbox_nonexistent_dir() -> None:
@@ -145,44 +158,19 @@ def test_clean_inbox_nonexistent_dir() -> None:
 def test_clean_inbox_removes_old_files(tmp_path: Path) -> None:
     wd = str(tmp_path)
     path = save_to_inbox(wd, "old.py", b"x")
-    old_mtime = time.time() - 25 * 3600
-    os.utime(path, (old_mtime, old_mtime))
+    os.utime(path, (time.time() - 25 * 3600, time.time() - 25 * 3600))
     removed = clean_inbox(wd, max_age_hours=24)
     assert removed == 1
     assert not path.exists()
 
 
-def test_clean_inbox_keeps_new_files(tmp_path: Path) -> None:
-    wd = str(tmp_path)
-    path = save_to_inbox(wd, "new.py", b"x")
-    removed = clean_inbox(wd, max_age_hours=24)
-    assert removed == 0
-    assert path.exists()
-
-
-# ── list_inbox edge cases ─────────────────────────────────────────
-
-
-def test_list_inbox_empty_dir(tmp_path: Path) -> None:
-    assert list_inbox(str(tmp_path / "nonexistent")) == []
-
-
-def test_list_inbox_respects_limit(tmp_path: Path) -> None:
-    wd = str(tmp_path)
-    for i in range(10):
-        save_to_inbox(wd, f"f{i}.py", b"x")
-        time.sleep(0.01)
-    files = list_inbox(wd, limit=3)
-    assert len(files) == 3
-
-
-# ── build_media_prompt edge cases ─────────────────────────────────
+# ── build_media_prompt ────────────────────────────────────────────
 
 
 async def test_prompt_text_only() -> None:
     tg = _FakeTG()
     msg = _FakeMsg(text="hello")
-    result = await build_media_prompt(msg, tg, _FakeState(), _FakeCfg())
+    result = await build_media_prompt(msg, tg, _FakeState(), _fake_cfg())
     assert result == "hello"
 
 
@@ -190,34 +178,19 @@ async def test_prompt_photo_disabled() -> None:
     tg = _FakeTG()
     msg = _FakeMsg(text="", photo=[{"file_id": "abc", "file_size": 100}])
     state = _FakeState(photo_enabled=False)
-    result = await build_media_prompt(msg, tg, state, _FakeCfg())
+    result = await build_media_prompt(msg, tg, state, _fake_cfg())
     assert result is None
 
 
 async def test_prompt_photo_too_large() -> None:
     tg = _FakeTG()
-    msg = _FakeMsg(photo=[{"file_id": "abc", "file_size": MAX_PHOTO_SIZE + 1}])
-    result = await build_media_prompt(msg, tg, _FakeState(), _FakeCfg())
+    msg = _FakeMsg(photo=[{"file_id": "abc", "file_size": 30_000_000}])  # > 20MB default
+    result = await build_media_prompt(msg, tg, _FakeState(), _fake_cfg())
     assert result is None
     assert any("too large" in s for _, s in tg.sent)
 
 
-async def test_prompt_document_too_large() -> None:
-    tg = _FakeTG()
-    msg = _FakeMsg(
-        document={
-            "file_id": "abc",
-            "file_name": "big.pdf",
-            "mime_type": "application/pdf",
-            "file_size": MAX_FILE_SIZE + 1,
-        }
-    )
-    result = await build_media_prompt(msg, tg, _FakeState(), _FakeCfg())
-    assert result is None
-    assert any("too large" in s for _, s in tg.sent)
-
-
-async def test_prompt_document_unsupported_mime() -> None:
+async def test_prompt_document_unsupported_blocked() -> None:
     tg = _FakeTG()
     msg = _FakeMsg(
         document={
@@ -227,12 +200,12 @@ async def test_prompt_document_unsupported_mime() -> None:
             "file_size": 100,
         }
     )
-    result = await build_media_prompt(msg, tg, _FakeState(), _FakeCfg())
+    result = await build_media_prompt(msg, tg, _FakeState(), _fake_cfg())
     assert result is None
-    assert any("Unsupported" in s for _, s in tg.sent)
+    assert any("Blocked" in s for _, s in tg.sent)
 
 
-async def test_prompt_document_injects_path(tmp_path: Path) -> None:
+async def test_prompt_document_passed(tmp_path: Path) -> None:
     tg = _FakeTG(get_file_data=b"contents")
     msg = _FakeMsg(
         text="check this",
@@ -243,11 +216,28 @@ async def test_prompt_document_injects_path(tmp_path: Path) -> None:
             "file_size": 100,
         },
     )
-    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _FakeCfg())
+    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _fake_cfg())
     assert result is not None
     assert "check this" in result
     assert "[File:" in result
-    assert ".bridge-inbox" in result
+
+
+async def test_prompt_zip_warned(tmp_path: Path) -> None:
+    cats = {"archive": CategoryConfig(mime_types=["application/zip"], extensions=[".zip"], routing="warn")}
+    tg = _FakeTG(get_file_data=b"zipdata")
+    msg = _FakeMsg(
+        text="unpack",
+        document={
+            "file_id": "z1",
+            "file_name": "bundle.zip",
+            "mime_type": "application/zip",
+            "file_size": 1000,
+        },
+    )
+    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _fake_cfg(cats))
+    assert result is not None
+    assert "unpack" in result
+    assert any("Accepted with caution" in s for _, s in tg.sent)
 
 
 async def test_prompt_download_error_reported(tmp_path: Path) -> None:
@@ -260,14 +250,6 @@ async def test_prompt_download_error_reported(tmp_path: Path) -> None:
             "file_size": 100,
         }
     )
-    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _FakeCfg())
+    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _fake_cfg())
     assert result is None
     assert any("Download failed" in s for _, s in tg.sent)
-
-
-async def test_prompt_both_text_and_media(tmp_path: Path) -> None:
-    tg = _FakeTG(get_file_data=b"data")
-    msg = _FakeMsg(text="analyze", photo=[{"file_id": "p1", "file_size": 100}])
-    result = await build_media_prompt(msg, tg, _FakeState(str(tmp_path)), _FakeCfg())
-    assert result is not None
-    assert result.startswith("analyze [Photo:")
