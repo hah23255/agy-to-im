@@ -31,10 +31,54 @@ class AgyConfig:
     mode: str = "code"  # "code" (auto) | "plan" (read-only sandbox)
 
 
+@dataclass
+class CategoryConfig:
+    mime_types: list[str] = field(default_factory=list)
+    extensions: list[str] = field(default_factory=list)
+    max_size_bytes: int = 52_428_800
+    routing: str = "block"  # pass | warn | hold | block
+
+
+@dataclass
+class MediaSafetyConfig:
+    max_photo_bytes: int = 20_971_520
+    max_file_bytes: int = 52_428_800
+    categories: dict[str, CategoryConfig] = field(default_factory=dict)
+    default_routing: str = "block"
+
+
+@dataclass
+class QueueConfig:
+    max_depth: int = 10
+    max_per_user: int = 5
+    cooldown_seconds: int = 2
+
+
+@dataclass
+class MemoryConfig:
+    limit_bytes: int = 805_306_368
+    check_interval_loops: int = 30
+
+
+@dataclass
+class InboxConfig:
+    max_age_hours: int = 24
+    max_total_bytes: int = 524_288_000
+
+
+@dataclass
+class SafetyConfig:
+    media: MediaSafetyConfig = field(default_factory=MediaSafetyConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    inbox: InboxConfig = field(default_factory=InboxConfig)
+
+
 @dataclass(frozen=True)
 class Config:
     telegram: TelegramConfig
     agy: AgyConfig
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
 
 
 def load_config(path: Path) -> Config:
@@ -107,4 +151,38 @@ def load_config(path: Path) -> Config:
             model=model,
             mode=mode,
         ),
+        safety=_parse_safety(raw.get("safety")),
     )
+
+
+def _parse_safety(raw: dict | None) -> SafetyConfig:
+    if not raw:
+        return SafetyConfig()
+    cats: dict[str, CategoryConfig] = {}
+    for cat_name, cat_raw in (raw.get("media", {}).get("categories", {}) or {}).items():
+        cats[cat_name] = CategoryConfig(
+            mime_types=list(cat_raw.get("mime_types", [])),
+            extensions=list(cat_raw.get("extensions", [])),
+            max_size_bytes=int(cat_raw.get("max_size_bytes", 52_428_800)),
+            routing=str(cat_raw.get("routing", "block")),
+        )
+    media = MediaSafetyConfig(
+        max_photo_bytes=int(raw.get("media", {}).get("max_photo_bytes", 20_971_520)),
+        max_file_bytes=int(raw.get("media", {}).get("max_file_bytes", 52_428_800)),
+        categories=cats,
+        default_routing=str(raw.get("media", {}).get("default_routing", "block")),
+    )
+    queue = QueueConfig(
+        max_depth=int(raw.get("queue", {}).get("max_depth", 10)),
+        max_per_user=int(raw.get("queue", {}).get("max_per_user", 5)),
+        cooldown_seconds=int(raw.get("queue", {}).get("cooldown_seconds", 2)),
+    )
+    memory = MemoryConfig(
+        limit_bytes=int(raw.get("memory", {}).get("limit_bytes", 805_306_368)),
+        check_interval_loops=int(raw.get("memory", {}).get("check_interval_loops", 30)),
+    )
+    inbox = InboxConfig(
+        max_age_hours=int(raw.get("inbox", {}).get("max_age_hours", 24)),
+        max_total_bytes=int(raw.get("inbox", {}).get("max_total_bytes", 524_288_000)),
+    )
+    return SafetyConfig(media=media, queue=queue, memory=memory, inbox=inbox)

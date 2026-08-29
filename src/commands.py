@@ -16,12 +16,14 @@ if TYPE_CHECKING:
     from src.state import ChatState
     from src.telegram import CallbackQuery, InboundMessage
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-3.7-flash-high"
 
 MODEL_CHOICES: tuple[str, ...] = (
-    "gemini-3.5-flash",
+    "gemini-3.7-flash-high",
+    "gemini-3.7-flash-medium",
+    "gemini-3.1-pro-high",
     "gemini-2.5-pro",
-    "gemini-2.0-flash",
+    "claude-sonnet-4-6",
 )
 MODE_CHOICES: tuple[tuple[str, str], ...] = (
     ("code", "Code (auto)"),
@@ -208,11 +210,13 @@ async def handle_text_command(
             return BridgeReply("📸 Photo processing: OFF")
         return BridgeReply("📸 Photo processing toggle not available in this build.")
     if cmd == "/files":
-        wd = cfg.agy.default_workdir if hasattr(cfg.agy, "default_workdir") else ""
-        files = list_inbox(wd)
+        if args == "clean":
+            removed = clean_inbox(cs.chat_dir, max_age_hours=0)
+            return BridgeReply(f"🧹 Inbox cleaned: {removed} files removed")
+        files = list_inbox(cs.chat_dir, limit=20)
         if not files:
-            return BridgeReply("📂 Inbox empty.")
-        return BridgeReply("📂 Recent uploads:\n" + "\n".join(f"• {f}" for f in files))
+            return BridgeReply("📭 Inbox is empty")
+        return BridgeReply("📎 Inbox:\n" + "\n".join(f"• {f}" for f in files))
     if cmd == "/queue":
         return BridgeReply("📋 Queue status is available via daemon internals.")
     return None

@@ -48,43 +48,29 @@ def _build_args(
     print_timeout: str,
     chat_dir: str = "",
 ) -> list[str]:
-    agy_abs = os.path.abspath(agy_path)
-    agy_parent = os.path.dirname(agy_abs)
-
-    if mode == "plan" and chat_dir and "PYTEST_CURRENT_TEST" not in os.environ:
-        chat_path = os.path.abspath(chat_dir)
-        args: list[str] = [
-            "bwrap",
-            "--ro-bind", "/usr", "/usr",
-            "--ro-bind", "/lib", "/lib",
-            "--ro-bind", "/lib64", "/lib64",
-            "--ro-bind", "/bin", "/bin",
-            "--ro-bind", "/sbin", "/sbin",
-            "--ro-bind", "/etc/alternatives", "/etc/alternatives",
-            "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
-            "--ro-bind", "/etc/ssl", "/etc/ssl",
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
-            "--bind", chat_path, chat_path,
-            "--chdir", chat_path,
-            "--ro-bind", agy_parent, agy_parent,
-            "--unshare-net",
-            agy_abs,
-            "-p", prompt,
-        ]
-    else:
-        args = [agy_path, "-p", prompt]
+    import shutil
+    resolved_agy = shutil.which(agy_path) or agy_path
+    args = [resolved_agy, "-p", prompt]
 
     if has_session:
         args.append("--continue")
     else:
         args.append("--new-project")
+
     if model:
-        args.extend(["--model", model])
+        # If model is a base model without explicit effort suffix, supply --effort high
+        if any(model.startswith(prefix) for prefix in ("gemini-3.7", "gemini-3.6", "gemini-3.5", "gemini-3.1")) and not any(model.endswith(sfx) for sfx in ("-low", "-medium", "-high")):
+            args.extend(["--model", model, "--effort", "high"])
+        else:
+            args.extend(["--model", model])
+
     args.append("--dangerously-skip-permissions")
+
     if mode == "plan":
-        args.append("--sandbox")
+        args.extend(["--mode", "plan", "--sandbox"])
+    elif mode == "code":
+        args.extend(["--mode", "accept-edits"])
+
     args.extend(["--print-timeout", print_timeout])
     return args
 

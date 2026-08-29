@@ -18,6 +18,32 @@ LOG = logging.getLogger("antigravity_telegram_bridge")
 AGY_TIMEOUT_S = 900.0
 
 
+async def _compile_memory_layer(chat_dir: str) -> None:
+    """Run graphify extract and export in the background to build the OKF memory vault."""
+    try:
+        import shutil
+        graphify_bin = shutil.which("graphify") or "/home/i/.local/bin/graphify"
+        # Run graphify extract . (AST + semantic codebase index)
+        proc1 = await asyncio.create_subprocess_exec(
+            graphify_bin, "extract", ".",
+            cwd=chat_dir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc1.wait()
+        
+        # Run graphify export okf --dir concepts (Google OKF v0.1 bundle)
+        proc2 = await asyncio.create_subprocess_exec(
+            graphify_bin, "export", "okf", "--dir", "concepts",
+            cwd=chat_dir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc2.wait()
+        LOG.info("OKF-Graphify memory layer successfully updated for %s", chat_dir)
+    except Exception as exc:
+        LOG.warning("Failed to update OKF-Graphify memory layer: %s", exc)
+
 async def execute_agy(
     tg: "_TelegramLike", chat_id: int, msg: "InboundMessage",
     cs: "ChatState", cfg: "Config", agy_path: str,
@@ -36,6 +62,8 @@ async def execute_agy(
             agy_path=agy_path,
             timeout=AGY_TIMEOUT_S,
         )
+        if result.exit_code == 0:
+            asyncio.create_task(_compile_memory_layer(cs.chat_dir))
     finally:
         hb_stop.set()
         hb_task.cancel()
@@ -44,8 +72,16 @@ async def execute_agy(
         except (asyncio.CancelledError, Exception):
             pass
     elapsed = int((time.perf_counter() - turn_start) * 1000)
-    LOG.info("turn chat=%d cwd=%s exit=%d ms=%d reply_len=%d",
-             chat_id, cs.chat_dir, result.exit_code, elapsed, len(result.text or ""))
+    if result.exit_code != 0:
+        LOG.error(
+            "turn failed chat=%d cwd=%s exit=%d ms=%d stderr=%s",
+            chat_id, cs.chat_dir, result.exit_code, elapsed, result.stderr.strip(),
+        )
+    else:
+        LOG.info(
+            "turn chat=%d cwd=%s exit=%d ms=%d reply_len=%d",
+            chat_id, cs.chat_dir, result.exit_code, elapsed, len(result.text or ""),
+        )
     return result.text or "", result.exit_code
 
 

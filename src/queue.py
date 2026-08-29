@@ -3,14 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from src.config import QueueConfig
     from src.telegram import InboundMessage
 
 LOG = logging.getLogger("antigravity_telegram_bridge")
 MAX_QUEUE_DEPTH = 5
+
+
+class RateLimit:
+    __slots__ = ("timestamps",)
+    def __init__(self):
+        self.timestamps: deque[float] = deque()
 
 
 @dataclass
@@ -24,6 +33,10 @@ class TurnQueue:
     active: bool = False
     pending: list[tuple[int, "InboundMessage", asyncio.Future[str | None]]] = field(default_factory=list)
     owner_chat_id: int = 0
+    # Rate limit state
+    _limits: dict[int, RateLimit] = field(default_factory=dict)
+    max_per_user: int = 5
+    cooldown_seconds: int = 2
 
     def _pos(self, chat_id: int) -> int:
         for i, (cid, _, _) in enumerate(self.pending):
@@ -33,6 +46,19 @@ class TurnQueue:
 
     def _already_queued(self, chat_id: int) -> bool:
         return any(cid == chat_id for cid, _, _ in self.pending)
+
+    def check_ratelimit(self, user_id: int) -> tuple[bool, int]:
+        """Returns (allowed, wait_seconds). Sliding window per user."""
+        now = time.time()
+        rl = self._limits.setdefault(user_id, RateLimit())
+        window = self.cooldown_seconds * 2
+        while rl.timestamps and rl.timestamps[0] < now - window:
+            rl.timestamps.popleft()
+        if len(rl.timestamps) >= self.max_per_user:
+            wait = int(rl.timestamps[0] + window - now) + 1
+            return False, max(wait, 0)
+        rl.timestamps.append(now)
+        return True, 0
 
     async def submit(self, msg: "InboundMessage") -> str | None:
         """Submit a message for processing. Returns queued status str or None to proceed.
