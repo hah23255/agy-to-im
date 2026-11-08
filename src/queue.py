@@ -24,28 +24,61 @@ class RateLimit:
 
 @dataclass
 class TurnQueue:
-    """FIFO queue ensuring one agy turn at a time across all chats.
+    """FIFO queue executed by a single daemon worker — one agy turn at a time.
 
-    When a turn is active, subsequent messages are enqueued.
-    Each chat may have at most one pending message.
-    Owner (first in allowed_user_ids) always skips the queue.
+    submit() never blocks the polling loop: it either hands the message to
+    the worker (returns None) or parks it in the FIFO and returns a status
+    string for the user. The worker consumes via get()/task_done().
     """
-    active: bool = False
-    pending: list[tuple[int, "InboundMessage", asyncio.Future[str | None]]] = field(default_factory=list)
-    owner_chat_id: int = 0
-    # Rate limit state
-    _limits: dict[int, RateLimit] = field(default_factory=dict)
+    max_depth: int = MAX_QUEUE_DEPTH
     max_per_user: int = 5
     cooldown_seconds: int = 2
+    active: bool = False
+    _q: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False, compare=False)
+    _limits: dict[int, RateLimit] = field(default_factory=dict, repr=False, compare=False)
 
-    def _pos(self, chat_id: int) -> int:
-        for i, (cid, _, _) in enumerate(self.pending):
-            if cid == chat_id:
-                return i + 1
-        return len(self.pending) + 1
+    def submit(self, msg: "InboundMessage") -> str | None:
+        """Enqueue a message for processing. Returns None when the worker will
+        pick it up immediately, or a status string when it was parked.
 
-    def _already_queued(self, chat_id: int) -> bool:
-        return any(cid == chat_id for cid, _, _ in self.pending)
+        Synchronous by design — safe to call from the polling loop while a
+        turn is executing, because the loop never waits on the turn itself.
+        """
+        if self._q.qsize() >= self.max_depth:
+            return "🚫 Queue full. Try again shortly."
+        busy = self.active or self._q.qsize() > 0
+        self._q.put_nowait(msg)
+        # A turn is now pending or executing until the worker completes it.
+        self.active = True
+        if busy:
+            return f"⏳ Queued (position #{self._q.qsize() - 1}). Processing soon…"
+        return None
+
+    async def get(self) -> "InboundMessage":
+        """Worker-side: wait for the next message to execute."""
+        return await self._q.get()
+
+    def task_done(self) -> None:
+        """Worker-side: mark the item taken via get() as fully processed."""
+        self._q.task_done()
+
+    async def join(self) -> None:
+        """Wait until every submitted item has been processed (graceful drain)."""
+        await self._q.join()
+
+    def qsize(self) -> int:
+        return self._q.qsize()
+
+    def complete(self) -> None:
+        """Clear the active flag once nothing is pending or executing."""
+        if self._q.qsize() == 0:
+            self.active = False
+
+    def reset(self) -> None:
+        """Drop all queued messages and bookkeeping (used at daemon startup)."""
+        self.active = False
+        self._limits.clear()
+        self._q = asyncio.Queue()
 
     def check_ratelimit(self, user_id: int) -> tuple[bool, int]:
         """Returns (allowed, wait_seconds). Sliding window per user."""
@@ -60,51 +93,10 @@ class TurnQueue:
         rl.timestamps.append(now)
         return True, 0
 
-    async def submit(self, msg: "InboundMessage") -> str | None:
-        """Submit a message for processing. Returns queued status str or None to proceed.
-
-        Returns None when the caller should execute immediately.
-        Returns a str when the message was enqueued (status for user).
-        """
-        cid = msg.chat_id
-
-        # Owner bypass
-        if cid == self.owner_chat_id:
-            return None
-
-        # Already active — enqueue
-        if self.active:
-            if self._already_queued(cid):
-                return None  # replace previous
-            if len(self.pending) >= MAX_QUEUE_DEPTH:
-                return "🚫 Queue full. Try again shortly."
-            fut: asyncio.Future[str | None] = asyncio.Future()
-            self.pending.append((cid, msg, fut))
-            return f"⏳ Queued (position #{len(self.pending)}). Processing soon…"
-
-        # Not active — proceed
-        self.active = True
-        return None
-
-    def complete(self) -> None:
-        """Mark current turn as complete."""
-        self.active = False
-
-    def next(self) -> tuple["InboundMessage", asyncio.Future[str | None]] | None:
-        """Return next queued message or None."""
-        if not self.pending:
-            return None
-        _, msg, fut = self.pending.pop(0)
-        self.active = True
-        return msg, fut
-
     def status(self) -> list[str]:
         lines = [f"Active: {'yes' if self.active else 'no'}"]
-        if self.pending:
-            lines.append(f"Queue ({len(self.pending)}):")
-            for i, (cid, msg, _) in enumerate(self.pending):
-                preview = msg.text[:40] + ("…" if len(msg.text) > 40 else "")
-                lines.append(f"  #{i+1} chat={cid} \"{preview}\"")
+        if self._q.qsize():
+            lines.append(f"Queue depth: {self._q.qsize()}")
         else:
             lines.append("Queue: empty")
         return lines

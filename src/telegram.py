@@ -684,6 +684,16 @@ class TelegramClient:
         mid = result.get("message_id")
         return mid if isinstance(mid, int) else None
 
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        assert self._client is not None
+        r = await self._client.post(
+            f"{self._base}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+        )
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"deleteMessage failed: {data.get('description')}")
+
     async def delete_webhook(self) -> dict[str, Any]:
         assert self._client is not None
         r = await self._client.get(f"{self._base}/deleteWebhook")
