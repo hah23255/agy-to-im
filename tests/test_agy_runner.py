@@ -216,3 +216,43 @@ def test_abort_turn_when_not_running() -> None:
 
     assert abort_turn("/nonexistent/chat/dir") is False
 
+
+
+async def test_run_agy_cancellation_kills_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling run_agy must kill the child subprocess, not orphan it."""
+    import asyncio
+    import sys
+
+    import src.agy_runner as ar
+
+    procs: list[object] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def recording_exec(*args: object, **kwargs: object):
+        p = await real_exec(*args, **kwargs)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_exec)
+    monkeypatch.setattr(
+        ar, "_build_args",
+        lambda **kwargs: [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    task = asyncio.create_task(run_agy(
+        prompt="hi", chat_dir=str(tmp_path), has_session=False,
+        model="", mode="code", agy_path=sys.executable,
+    ))
+    for _ in range(100):
+        if procs:
+            break
+        await asyncio.sleep(0.02)
+    assert procs, "child process should have been spawned"
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await asyncio.sleep(0.2)
+    assert procs[0].returncode is not None, "child must be killed on cancellation"

@@ -651,3 +651,45 @@ async def test_blocked_media_deletes_placeholder(
     )
     assert any("Blocked" in t for _, t in tg.sent_messages)
     assert tg.deleted_messages, "placeholder must be cleaned up when all content is blocked"
+
+
+# ── Review fixes: shared singleton + worker error path ────────────────────
+
+
+def test_queue_singleton_is_shared_between_queue_and_daemon() -> None:
+    import src.daemon as daemon_mod
+    import src.queue as queue_mod
+
+    assert queue_mod.QUEUE is daemon_mod._QUEUE, (
+        "/queue must observe the same TurnQueue the worker consumes, "
+        "even when the daemon runs as __main__"
+    )
+
+
+async def test_turn_worker_releases_queue_when_chat_state_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.daemon as daemon_mod
+    from src.queue import TurnQueue
+    from src.state import State
+    from src.telegram import InboundMessage
+
+    q = TurnQueue()
+    monkeypatch.setattr(daemon_mod, "_QUEUE", q)
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("chat dir unavailable")
+
+    monkeypatch.setattr(daemon_mod, "_ensure_chat_state", _boom)
+
+    q.submit(InboundMessage(update_id=1, chat_id=10, user_id=42, text="hi"))
+    worker = asyncio.create_task(daemon_mod._turn_worker(
+        tg=None, state=State(), state_path=tmp_path / "state.json",
+        chats_root=tmp_path / "chats", cfg=_cfg(), agy_path="/usr/bin/true",
+    ))
+    try:
+        await asyncio.wait_for(q.join(), timeout=3)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    assert q.active is False

@@ -24,6 +24,8 @@ _STDOUT_CAP_BYTES = 524_288  # 512 KiB
 # Reap any defunct child processes left by prior subprocess invocations
 # (bwrap sandbox can leave orphaned grand-children).
 def _reap_zombies() -> None:
+    if not hasattr(os, "WNOHANG"):
+        return  # POSIX-only API; Windows has no fork() and thus no zombies
     try:
         while True:
             pid, _status = os.waitpid(-1, os.WNOHANG)
@@ -271,6 +273,16 @@ async def run_agy(
             except Exception:
                 pass
         return AgyResult(text="", exit_code=124, stderr=f"agy timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # Cancellation must not orphan the child: stop it and wait for it to
+        # exit BEFORE dropping the registry entry, then re-raise.
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        raise
     except Exception as exc:
         if proc:
             try:

@@ -17,7 +17,7 @@ from src.config import Config, load_config
 from src.health import memory_healthy, record_error, record_turn, start_server
 from src.media import build_media_prompt, clean_inbox
 from src.okf_memory import attach_memory
-from src.queue import TurnQueue
+from src.queue import QUEUE as _QUEUE, TurnQueue
 from src.state import ChatState, State, load_state, save_state
 from src.telegram import CallbackQuery, InboundMessage, TelegramClient, is_authorized
 from src.turn import execute_agy
@@ -31,7 +31,6 @@ DEFAULT_AGY_BIN = "agy"
 LONG_POLL_TIMEOUT = 30
 AGY_TIMEOUT_S = 900.0
 DRAIN_TIMEOUT_S = 30.0
-_QUEUE = TurnQueue()
 
 
 class _TelegramLike(Protocol):
@@ -405,13 +404,15 @@ async def _turn_worker(
     """
     while True:
         msg = await _QUEUE.get()
-        cs = _ensure_chat_state(state, msg.chat_id, chats_root)
+        cs: ChatState | None = None
         try:
+            cs = _ensure_chat_state(state, msg.chat_id, chats_root)
             await _do_turn(msg, tg, cs, cfg, agy_path)
             save_state(state_path, state)
         except asyncio.CancelledError:
             # Shutdown mid-turn: kill the agy subprocess so it cannot outlive us.
-            abort_turn(cs.chat_dir)
+            if cs is not None:
+                abort_turn(cs.chat_dir)
             raise
         except Exception:
             LOG.exception("turn worker failed chat=%d", msg.chat_id)
@@ -570,14 +571,15 @@ async def run(
                 await asyncio.sleep(0)
             save_state(state_path, state)
 
-        # Graceful shutdown: let the worker finish the in-flight and queued
-        # turns (bounded), then cancel it. systemd's kill is the last resort.
+        # Graceful drain only after a normal stop; any exit path (exception or
+        # cancellation) must still tear the worker down via the finally below.
         try:
             await asyncio.wait_for(_QUEUE.join(), timeout=DRAIN_TIMEOUT_S)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             pass
-        worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
 
 
 # Aliases to avoid name collisions in the loop above

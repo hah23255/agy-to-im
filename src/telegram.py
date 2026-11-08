@@ -685,6 +685,7 @@ class TelegramClient:
         return mid if isinstance(mid, int) else None
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Delete a message sent by the bot (Telegram deleteMessage API)."""
         assert self._client is not None
         r = await self._client.post(
             f"{self._base}/deleteMessage",

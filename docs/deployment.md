@@ -1,6 +1,6 @@
 # Deployment guide
 
-A streamlined install-only guide for getting the Antigravity Telegram bridge running on a fresh host. The longer reference (with troubleshooting, upgrade, uninstall) is [`operations.md`](operations.md).
+A streamlined install-only guide for getting the Antigravity Telegram bridge running on a fresh host. The longer reference (with troubleshooting, upgrade, uninstall) is [`OPERATIONS.md`](OPERATIONS.md).
 
 ---
 
@@ -151,7 +151,7 @@ Required GitHub Repository Secrets:
 
 ## Done
 
-The bridge is operational. Day-to-day ops are in [`operations.md`](operations.md). Architecture rationale is in [`design.md`](design.md). Security notes are in [`SECURITY.md`](../SECURITY.md) and [`security-scan.md`](security-scan.md).
+The bridge is operational. Day-to-day ops are in [`OPERATIONS.md`](OPERATIONS.md). Architecture rationale is in [`design.md`](design.md). Security notes are in [`SECURITY.md`](../SECURITY.md) and [`security-scan.md`](security-scan.md).
 
 ## What to do if something goes wrong
 

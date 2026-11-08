@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from src.media import clean_inbox, list_inbox
+from src.queue import QUEUE
 from src.state import is_valid_model
 from src.telegram import InlineKeyboard
 
@@ -592,9 +593,7 @@ async def handle_text_command(
             return BridgeReply("📭 Inbox is empty")
         return BridgeReply("📎 Inbox:\n" + "\n".join(f"• {f}" for f in files))
     if cmd == "/queue":
-        from src.daemon import _QUEUE  # lazy import avoids a circular import
-
-        lines = _QUEUE.status()
+        lines = QUEUE.status()
         return BridgeReply("📋 Turn queue\n" + "\n".join(f"• {line}" for line in lines))
     if cmd in ("/getfile", "/sendfile", "/download"):
         if not args:
