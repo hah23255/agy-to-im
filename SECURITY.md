@@ -4,7 +4,7 @@
 
 If you find a security issue in `antigravity-telegram-bridge`, please **do not open a public GitHub issue**.
 
-Instead, open a private security advisory at <https://github.com/yourusername/antigravity-telegram-bridge/security/advisories/new>, or email the maintainer with the subject prefix `[security]`. Include:
+Instead, open a private security advisory at <https://github.com/RosyidAl/Telegrav/security/advisories/new>, or email the maintainer with the subject prefix `[security]`. Include:
 
 - A clear description of the issue.
 - Reproduction steps or a proof-of-concept.

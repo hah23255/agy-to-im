@@ -373,7 +373,7 @@ The repo lives at `~/.gemini/extensions/antigravity-telegram-bridge/`. To publis
 
 ```sh
 cd ~/.gemini/extensions/antigravity-telegram-bridge
-git remote add origin https://github.com/YOUR_USER/agy-to-im.git
+git remote add origin https://github.com/RosyidAl/Telegrav.git
 git push -u origin main
 ```
 

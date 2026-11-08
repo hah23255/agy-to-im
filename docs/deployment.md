@@ -37,7 +37,7 @@ Message [@userinfobot](https://t.me/userinfobot). It replies with your numeric u
 ## Step 3 — Clone
 
 ```sh
-git clone https://github.com/RosyidAl/agy-to-im.git \
+git clone https://github.com/RosyidAl/Telegrav.git \
   ~/projects/agy-to-im
 mkdir -p ~/.gemini/extensions
 ln -sfn ~/projects/agy-to-im ~/.gemini/extensions/antigravity-telegram-bridge
