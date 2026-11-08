@@ -28,3 +28,6 @@ logs/
 # Agent skills local symlinks
 .agents/skills/
 
+
+# ZCode tooling state
+.zcode/
