@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
-from src.agy_runner import AgyResult
+from src.agy_runner import AgyResult, abort_turn
 from src.commands import BOT_COMMANDS, BridgeReply, handle_callback, handle_text_command
 from src.config import Config, load_config
 from src.health import memory_healthy, record_error, record_turn, start_server
@@ -30,6 +30,7 @@ DEFAULT_CHATS_ROOT = Path.home() / ".antigravity" / "bridge" / "chats"
 DEFAULT_AGY_BIN = "agy"
 LONG_POLL_TIMEOUT = 30
 AGY_TIMEOUT_S = 900.0
+DRAIN_TIMEOUT_S = 30.0
 _QUEUE = TurnQueue()
 
 
@@ -44,6 +45,7 @@ class _TelegramLike(Protocol):
     async def edit_message_text(
         self, chat_id: int, message_id: int, text: str, *, keyboard: Any | None = None
     ) -> None: ...
+    async def delete_message(self, chat_id: int, message_id: int) -> None: ...
     async def answer_callback_query(self, callback_query_id: str, *, text: str = "") -> None: ...
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None: ...
     async def set_my_commands(
@@ -273,20 +275,29 @@ async def _do_turn(
     msg: InboundMessage, tg: _TelegramLike, cs: ChatState,
     cfg: Config, agy_path: str,
 ) -> None:
-    prompt = await build_media_prompt(msg, tg, cs, cfg)
-    if prompt is None:
-        return
     try:
         await tg.send_chat_action(msg.chat_id, "typing")
     except Exception:
         pass
 
-    # Instant feedback: Send progressive status placeholder within <300ms
+    # Instant feedback: Send progressive status placeholder within <300ms,
+    # BEFORE any media download so the user sees activity immediately.
     placeholder_mid: int | None = None
     try:
         placeholder_mid = await tg.send_message(msg.chat_id, "⏳ Menghubungkan ke agy...")
     except Exception as err:
         LOG.warning("Failed to send status placeholder: %s", err)
+
+    prompt = await build_media_prompt(msg, tg, cs, cfg)
+    if prompt is None:
+        # All content was blocked (or nothing routable) — remove the stray
+        # placeholder instead of leaving it dangling in the chat.
+        if placeholder_mid is not None:
+            try:
+                await tg.delete_message(msg.chat_id, placeholder_mid)
+            except Exception as err:
+                LOG.warning("deleteMessage failed chat=%s: %s", msg.chat_id, err)
+        return
 
     initial_files = set(Path(cs.chat_dir).iterdir()) if Path(cs.chat_dir).is_dir() else set()
     effective_msg = InboundMessage(
@@ -348,6 +359,11 @@ async def _process_text(
     state_path: Path, chats_root: Path, cfg: Config,
     agy_path: str, info: DaemonInfo,
 ) -> None:
+    """Fast path: auth, slash commands, queueing. Never runs a turn inline.
+
+    Turn execution lives in _turn_worker so the polling loop keeps fetching
+    updates while agy works.
+    """
     if not is_authorized(msg, cfg.telegram):
         LOG.info("drop unauth user=%s", msg.user_id)
         return
@@ -371,29 +387,37 @@ async def _process_text(
         LOG.info("drop inactive chat=%s user=%s", msg.chat_id, msg.user_id)
         return
 
-    status = await _QUEUE.submit(msg)
+    status = _QUEUE.submit(msg)  # sync — never blocks the polling loop
     if status is not None:
-        await tg.send_message(msg.chat_id, status)
-        return
-
-    try:
-        await _do_turn(msg, tg, cs, cfg, agy_path)
-    finally:
-        _QUEUE.complete()
-
-    while True:
-        next_item = _QUEUE.next()
-        if next_item is None:
-            break
-        nxt_msg, nxt_fut = next_item
-        nxt_cs = _ensure_chat_state(state, nxt_msg.chat_id, chats_root)
         try:
-            await _do_turn(nxt_msg, tg, nxt_cs, cfg, agy_path)
-        finally:
-            _QUEUE.complete()
-            nxt_fut.set_result(None)
+            await tg.send_message(msg.chat_id, status)
+        except Exception as err:
+            LOG.error("sendMessage failed chat=%s: %s", msg.chat_id, err)
 
-    save_state(state_path, state)
+
+async def _turn_worker(
+    tg: _TelegramLike, state: State, state_path: Path,
+    chats_root: Path, cfg: Config, agy_path: str,
+) -> None:
+    """Single consumer executing one agy turn at a time, FIFO order.
+
+    The polling loop stays free to fetch updates while turns run here.
+    """
+    while True:
+        msg = await _QUEUE.get()
+        cs = _ensure_chat_state(state, msg.chat_id, chats_root)
+        try:
+            await _do_turn(msg, tg, cs, cfg, agy_path)
+            save_state(state_path, state)
+        except asyncio.CancelledError:
+            # Shutdown mid-turn: kill the agy subprocess so it cannot outlive us.
+            abort_turn(cs.chat_dir)
+            raise
+        except Exception:
+            LOG.exception("turn worker failed chat=%d", msg.chat_id)
+        finally:
+            _QUEUE.task_done()
+            _QUEUE.complete()
 
 
 async def _process_callback(
@@ -429,11 +453,13 @@ async def _process_callback(
             LOG.error("fallback sendMessage failed: %s", err2)
 
 
-async def _fetch_updates(tg: _TelegramLike, offset: int) -> list[dict[str, Any]]:
+async def _fetch_updates(
+    tg: _TelegramLike, offset: int, poll_timeout: int = LONG_POLL_TIMEOUT,
+) -> list[dict[str, Any]]:
     try:
         return await asyncio.wait_for(
-            tg.get_updates(offset=offset, timeout=LONG_POLL_TIMEOUT),
-            timeout=LONG_POLL_TIMEOUT + 5,
+            tg.get_updates(offset=offset, timeout=poll_timeout),
+            timeout=poll_timeout + 5,
         )
     except asyncio.TimeoutError:
         return []
@@ -459,9 +485,10 @@ async def run(
     tg: _TelegramLike, agy_path: str, info: DaemonInfo,
     stop_event: asyncio.Event,
 ) -> None:
-    _QUEUE.owner_chat_id = cfg.telegram.allowed_user_ids[0] if cfg.telegram.allowed_user_ids else 0
     _QUEUE.max_per_user = cfg.safety.queue.max_per_user
     _QUEUE.cooldown_seconds = cfg.safety.queue.cooldown_seconds
+    _QUEUE.max_depth = cfg.safety.queue.max_depth
+    _QUEUE.reset()
     chats_root.mkdir(parents=True, exist_ok=True)
     allowed_dirs = [Path.home()]
     if cfg.agy.default_workdir:
@@ -476,6 +503,11 @@ async def run(
     tick = 0
     async with tg:
         await _register_bot_commands(tg)
+        # Turns run in a dedicated worker so the polling loop below never
+        # blocks on agy (which can run for up to AGY_TIMEOUT_S).
+        worker = asyncio.create_task(
+            _turn_worker(tg, state, state_path, chats_root, cfg, agy_path)
+        )
         while not stop_event.is_set():
             tick += 1
             # Health gate: check memory every ~30 loop iterations (~30s at idle,
@@ -502,7 +534,7 @@ async def run(
                 try:
                     await asyncio.sleep(0.3)
                     max_uid = max((int(u.get("update_id", 0)) for u in updates), default=state.last_update_id)
-                    more_updates = await _fetch_updates(tg, max_uid + 1, timeout=0)
+                    more_updates = await _fetch_updates(tg, max_uid + 1, poll_timeout=0)
                     if more_updates:
                         updates.extend(more_updates)
                 except Exception:
@@ -537,6 +569,15 @@ async def run(
             if not updates:
                 await asyncio.sleep(0)
             save_state(state_path, state)
+
+        # Graceful shutdown: let the worker finish the in-flight and queued
+        # turns (bounded), then cancel it. systemd's kill is the last resort.
+        try:
+            await asyncio.wait_for(_QUEUE.join(), timeout=DRAIN_TIMEOUT_S)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 # Aliases to avoid name collisions in the loop above

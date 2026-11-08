@@ -340,3 +340,22 @@ def test_style_hint_persists_in_state(tmp_path: Path) -> None:
     save_state(tmp_path / "s.json", st)
     loaded = load_state(tmp_path / "s.json", root)
     assert loaded.chats[42].style_hint is False
+
+
+async def test_queue_command_reports_real_status() -> None:
+    from src.daemon import _QUEUE
+    from src.telegram import InboundMessage
+
+    _QUEUE.reset()
+    try:
+        reply = await handle_text_command(_FakeMsg("/queue"), _state(), _cfg())
+        assert reply is not None
+        assert "Active" in reply.text
+
+        _QUEUE.submit(InboundMessage(update_id=1, chat_id=99, user_id=1, text="pending"))
+        _QUEUE.submit(InboundMessage(update_id=2, chat_id=98, user_id=1, text="pending2"))
+        reply2 = await handle_text_command(_FakeMsg("/queue"), _state(), _cfg())
+        assert reply2 is not None
+        assert "depth: 2" in reply2.text.lower()
+    finally:
+        _QUEUE.reset()

@@ -96,6 +96,7 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "getfile", "description": "Download a file from workspace"},
     {"command": "mcp", "description": "View and manage MCP servers and tools"},
     {"command": "skills", "description": "List and inspect available skills"},
+    {"command": "queue", "description": "Turn queue status"},
 ]
 
 
@@ -591,7 +592,10 @@ async def handle_text_command(
             return BridgeReply("📭 Inbox is empty")
         return BridgeReply("📎 Inbox:\n" + "\n".join(f"• {f}" for f in files))
     if cmd == "/queue":
-        return BridgeReply("📋 Queue status is available via daemon internals.")
+        from src.daemon import _QUEUE  # lazy import avoids a circular import
+
+        lines = _QUEUE.status()
+        return BridgeReply("📋 Turn queue\n" + "\n".join(f"• {line}" for line in lines))
     if cmd in ("/getfile", "/sendfile", "/download"):
         if not args:
             return BridgeReply("⚠️ Usage: /getfile <filename>")
