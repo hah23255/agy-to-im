@@ -100,6 +100,7 @@ class TurnQueue:
         return True, 0
 
     def status(self) -> list[str]:
+        """Render the queue state lines for /queue display."""
         lines = [f"Active: {'yes' if self.active else 'no'}"]
         if self._q.qsize():
             lines.append(f"Queue depth: {self._q.qsize()}")

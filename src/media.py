@@ -19,10 +19,12 @@ INBOX_DIR_NAME = ".bridge-inbox"
 # ── Legacy helpers (kept for backward compat during migration) ────────────
 
 async def download_photo(tg: "TelegramClient", file_id: str) -> bytes:
+    """Download a photo by file_id (legacy helper)."""
     return await tg.get_file(file_id)
 
 
 async def download_document(tg: "TelegramClient", file_id: str) -> bytes:
+    """Download a document by file_id (legacy helper)."""
     return await tg.get_file(file_id)
 
 
@@ -44,6 +46,7 @@ def save_to_inbox(workdir: str, filename: str, data: bytes, max_total_bytes: int
 
 
 def clean_inbox(workdir: str, max_age_hours: int = 24) -> int:
+    """Delete inbox files older than max_age_hours; returns the count removed."""
     inbox = Path(workdir) / INBOX_DIR_NAME
     if not inbox.exists():
         return 0
@@ -57,6 +60,7 @@ def clean_inbox(workdir: str, max_age_hours: int = 24) -> int:
 
 
 def list_inbox(workdir: str, limit: int = 5) -> list[str]:
+    """List the most recent inbox files as display strings."""
     inbox = Path(workdir) / INBOX_DIR_NAME
     if not inbox.exists():
         return []

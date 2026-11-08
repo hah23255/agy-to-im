@@ -82,6 +82,7 @@ class Config:
 
 
 def load_config(path: Path) -> Config:
+    """Load and validate config.json into a Config, applying token env overrides."""
     if not path.exists():
         raise ConfigError(f"config not found at {path}")
 
@@ -156,6 +157,7 @@ def load_config(path: Path) -> Config:
 
 
 def _parse_safety(raw: dict | None) -> SafetyConfig:
+    """Parse the safety section (media, queue, memory, inbox) from raw config."""
     if not raw:
         return SafetyConfig()
     cats: dict[str, CategoryConfig] = {}

@@ -17,6 +17,7 @@ WEBHOOK_PATH = "/webhook"
 
 
 def _verify_secret(body: bytes, header: str, token: str) -> bool:
+    """Verify the X-Telegram-Bot-Api-Secret-Token header against the shared secret."""
     if not header or not token:
         return False
     expected = hmac.new(

@@ -12,10 +12,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
+
+LOG = logging.getLogger("antigravity_telegram_bridge")
+
+# Bounded wait after proc.kill() so a wedged child cannot hang the caller.
+_KILL_WAIT_S = 5.0
 
 # Safety cap on stdout capture — prevents unbounded memory growth from
 # runaway agy output. 1MB is generous (typical replies are 1–5KB).
@@ -24,6 +30,7 @@ _STDOUT_CAP_BYTES = 524_288  # 512 KiB
 # Reap any defunct child processes left by prior subprocess invocations
 # (bwrap sandbox can leave orphaned grand-children).
 def _reap_zombies() -> None:
+    """Reap defunct child processes left by prior subprocess runs (POSIX only)."""
     if not hasattr(os, "WNOHANG"):
         return  # POSIX-only API; Windows has no fork() and thus no zombies
     try:
@@ -125,6 +132,7 @@ def _build_args(
     chat_dir: str = "",
     effort: str = "",
 ) -> list[str]:
+    """Build the agy CLI argv for one print-mode turn."""
     import shutil
     resolved_agy = shutil.which(agy_path) or agy_path
     args = [resolved_agy, "-p", prompt]
@@ -252,6 +260,7 @@ async def run_agy(
     result_usage: dict[str, int] | None = None
 
     async def _read_stdout() -> None:
+        """Consume agy stdout: capture the result event and forward stream events to on_event."""
         nonlocal final_response, result_error, result_usage
         if proc.stdout is None:
             return
@@ -279,6 +288,7 @@ async def run_agy(
             plain_text_lines.append(line)
 
     async def _read_stderr() -> str:
+        """Read agy stderr to completion and return it as text."""
         if proc.stderr is None:
             return ""
         raw = await proc.stderr.read()
@@ -302,13 +312,28 @@ async def run_agy(
         return AgyResult(text="", exit_code=124, stderr=f"agy timed out after {timeout}s")
     except asyncio.CancelledError:
         # Cancellation must not orphan the child: stop it and wait for it to
-        # exit BEFORE dropping the registry entry, then re-raise.
+        # exit BEFORE dropping the registry entry, then re-raise. Bounded so a
+        # wedged child or a repeated cancellation cannot hang the caller.
         if proc:
             try:
                 proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+            except Exception as exc:
+                LOG.warning("failed to kill agy child chat_dir=%s: %s", chat_dir, exc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_KILL_WAIT_S)
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "agy child chat_dir=%s still alive %ss after kill",
+                    chat_dir, _KILL_WAIT_S,
+                )
+            except asyncio.CancelledError:
+                LOG.warning(
+                    "run_agy cleanup interrupted by repeated cancellation chat_dir=%s",
+                    chat_dir,
+                )
+                raise
+            except Exception as exc:
+                LOG.warning("failed waiting for agy child chat_dir=%s: %s", chat_dir, exc)
         raise
     except Exception as exc:
         if proc:

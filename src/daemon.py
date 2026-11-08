@@ -31,28 +31,49 @@ DEFAULT_AGY_BIN = "agy"
 LONG_POLL_TIMEOUT = 30
 AGY_TIMEOUT_S = 900.0
 DRAIN_TIMEOUT_S = 30.0
+# Bounded wait for the worker to finish cleanup after cancellation, so a
+# worker wedged mid-cleanup cannot hang daemon shutdown.
+_WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 
 
 class _TelegramLike(Protocol):
     async def __aenter__(self) -> "_TelegramLike": ...
     async def __aexit__(self, *exc: object) -> None: ...
-    async def get_me(self) -> dict[str, Any]: ...
-    async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]: ...
+    async def get_me(self) -> dict[str, Any]:
+        """Fetch bot metadata via getMe."""
+        ...
+    async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]:
+        """Long-poll Telegram for new updates."""
+        ...
     async def send_message(
         self, chat_id: int, text: str, *, keyboard: Any | None = None
-    ) -> int | None: ...
+    ) -> int | None:
+        """Send a text message; returns the first message id."""
+        ...
     async def edit_message_text(
         self, chat_id: int, message_id: int, text: str, *, keyboard: Any | None = None
-    ) -> None: ...
-    async def delete_message(self, chat_id: int, message_id: int) -> None: ...
-    async def answer_callback_query(self, callback_query_id: str, *, text: str = "") -> None: ...
-    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None: ...
+    ) -> None:
+        """Edit an existing message's text/keyboard in place."""
+        ...
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Delete a previously sent bot message."""
+        ...
+    async def answer_callback_query(self, callback_query_id: str, *, text: str = "") -> None:
+        """Acknowledge a callback query with an optional toast."""
+        ...
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Send a chat action such as the typing indicator."""
+        ...
     async def set_my_commands(
         self, commands: list[dict[str, str]], *, scope: dict[str, Any] | None = None
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        """Register the bot command menu."""
+        ...
     async def send_document(
         self, chat_id: int, file_path: str | Path, *, caption: str = ""
-    ) -> int | None: ...
+    ) -> int | None:
+        """Upload a document to the chat; returns the message id."""
+        ...
 
 
 RunAgyFunc = Callable[..., Awaitable[AgyResult]]
@@ -66,16 +87,19 @@ class DaemonInfo:
 
 
 def _resolve_agy_path() -> str:
+    """Resolve the agy binary path from env or default."""
     return os.environ.get("AGY_BIN") or DEFAULT_AGY_BIN
 
 
 def _resolve_chats_root(cfg: Config) -> Path:
+    """Resolve the chats root directory from config."""
     if cfg.agy.chats_root:
         return Path(cfg.agy.chats_root).expanduser()
     return DEFAULT_CHATS_ROOT
 
 
 def _detect_agy_version(agy_path: str) -> str:
+    """Run agy --version and return its output (or 'unknown')."""
     try:
         out = subprocess.run(
             [agy_path, "--version"],
@@ -89,6 +113,7 @@ def _detect_agy_version(agy_path: str) -> str:
 
 
 def _ensure_chat_state(state: State, chat_id: int, chats_root: Path) -> ChatState:
+    """Return the ChatState for a chat, creating its directory on first use."""
     cs = state.chats.get(chat_id)
     if cs is not None:
         Path(cs.chat_dir).mkdir(parents=True, exist_ok=True)
@@ -118,6 +143,7 @@ def _record_usage(cs: ChatState, usage: dict[str, Any]) -> None:
 
 
 def _format_timeout_reply() -> str:
+    """Build the user-facing reply for a timed-out turn."""
     minutes = AGY_TIMEOUT_S / 60
     return (
         f"⏱️ agy turn cut off at {minutes:.0f} min.\n\n"
@@ -215,6 +241,7 @@ def _group_inbound_messages(messages: list[InboundMessage]) -> list[InboundMessa
     current_batch: list[InboundMessage] = []
 
     def flush_batch() -> None:
+        """Merge the current message batch into a single InboundMessage."""
         nonlocal current_batch
         if not current_batch:
             return
@@ -291,6 +318,7 @@ async def _do_turn(
     msg: InboundMessage, tg: _TelegramLike, cs: ChatState,
     cfg: Config, agy_path: str,
 ) -> None:
+    """Execute one agy turn for a message and deliver the reply to Telegram."""
     try:
         await tg.send_chat_action(msg.chat_id, "typing")
     except Exception:
@@ -348,8 +376,8 @@ async def _do_turn(
     if usage and usage.get("total_tokens"):
         try:
             _record_usage(cs, usage)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOG.warning("usage accounting failed chat=%d: %s", msg.chat_id, exc)
     # Post-turn maintenance: update OKF memory layer, clean inbox
     try:
         attach_memory(cs.chat_dir, None, bridge_version="0.2.0")
@@ -450,6 +478,7 @@ async def _process_callback(
     cq: CallbackQuery, tg: _TelegramLike, state: State,
     state_path: Path, chats_root: Path, cfg: Config, info: DaemonInfo,
 ) -> None:
+    """Handle an inline-keyboard callback query."""
     if not is_authorized(
         InboundMessage(update_id=cq.update_id, chat_id=cq.chat_id,
                        user_id=cq.user_id, text=""),
@@ -482,6 +511,7 @@ async def _process_callback(
 async def _fetch_updates(
     tg: _TelegramLike, offset: int, poll_timeout: int = LONG_POLL_TIMEOUT,
 ) -> list[dict[str, Any]]:
+    """Fetch Telegram updates with a bounded long-poll."""
     try:
         return await asyncio.wait_for(
             tg.get_updates(offset=offset, timeout=poll_timeout),
@@ -496,6 +526,7 @@ async def _fetch_updates(
 
 
 async def _register_bot_commands(tg: _TelegramLike) -> None:
+    """Register the bot's slash-command menu with Telegram."""
     try:
         res = await tg.set_my_commands(BOT_COMMANDS)
         if isinstance(res, dict) and res.get("ok"):
@@ -511,6 +542,7 @@ async def run(
     tg: _TelegramLike, agy_path: str, info: DaemonInfo,
     stop_event: asyncio.Event,
 ) -> None:
+    """Main polling loop: fetch updates, dispatch fast-path handling, feed the turn worker; drains and tears the worker down on stop."""
     _QUEUE.max_per_user = cfg.safety.queue.max_per_user
     _QUEUE.cooldown_seconds = cfg.safety.queue.cooldown_seconds
     _QUEUE.max_depth = cfg.safety.queue.max_depth
@@ -604,7 +636,21 @@ async def run(
             pass
         finally:
             worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+            try:
+                # shield() so the timeout mechanism itself never waits for the
+                # worker to honour cancellation — on timeout we proceed and
+                # leave the worker's cleanup running in the background.
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.gather(worker, return_exceptions=True)),
+                    timeout=_WORKER_SHUTDOWN_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "turn worker did not exit within %ss after cancellation",
+                    _WORKER_SHUTDOWN_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
 
 
 # Aliases to avoid name collisions in the loop above
@@ -613,6 +659,7 @@ from src.telegram import parse_update as parse_update_for_daemon
 
 
 async def _detect_bot_username(cfg: Config) -> str:
+    """Fetch the bot's @username via getMe."""
     try:
         async with TelegramClient(cfg.telegram.bot_token) as tg:
             me = await tg.get_me()
@@ -624,6 +671,7 @@ async def _detect_bot_username(cfg: Config) -> str:
 
 
 def main() -> None:
+    """Entry point: load config, start the health server, and run the daemon."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -639,6 +687,7 @@ def main() -> None:
     stop = asyncio.Event()
 
     async def _go() -> None:
+        """Wire signal handlers and run the daemon under the health server."""
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)

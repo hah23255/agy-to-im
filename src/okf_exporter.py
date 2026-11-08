@@ -18,6 +18,7 @@ import yaml
 
 # Helper to sanitize label to safe filename
 def safe_filename(label: str) -> str:
+    """Sanitize a string into a safe file name."""
     cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
     cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
     # Ensure it starts with alphanumeric or fallback

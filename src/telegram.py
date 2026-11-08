@@ -63,6 +63,7 @@ def markdown_to_telegram_html(text: str) -> str:
     # 1. Protect code blocks
     code_blocks: list[str] = []
     def _save_code_block(m: re.Match[str]) -> str:
+        """Replace fenced code blocks with placeholders before HTML conversion."""
         lang = m.group(1) or ""
         code = m.group(2)
         idx = len(code_blocks)
@@ -81,6 +82,7 @@ def markdown_to_telegram_html(text: str) -> str:
     # 2. Protect inline code
     inline_codes: list[str] = []
     def _save_inline_code(m: re.Match[str]) -> str:
+        """Replace inline code spans with placeholders before HTML conversion."""
         code = m.group(1)
         idx = len(inline_codes)
         tag = f"<code>{html.escape(code)}</code>"
@@ -92,6 +94,7 @@ def markdown_to_telegram_html(text: str) -> str:
     # 3. Protect existing valid Telegram HTML tags
     tg_tags: list[str] = []
     def _save_tg_tag(m: re.Match[str]) -> str:
+        """Protect Telegram entity tags (e.g. <tg-spoiler>) from escaping."""
         idx = len(tg_tags)
         tg_tags.append(m.group(0))
         return f"\x00TGTAG_{idx}\x00"
@@ -106,6 +109,7 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # 6. Handle headers (# Title, ## Title, ### Title)
     def _header_sub(m: re.Match[str]) -> str:
+        """Convert markdown headers to bold Telegram-safe HTML."""
         level = len(m.group(1))
         title = m.group(2).strip()
         title = title.replace("**", "").replace("__", "").strip(" *_")
@@ -120,6 +124,7 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # 6.5. Handle tables (must be done before inline formatting)
     def _render_table(m: re.Match[str]) -> str:
+        """Convert a markdown table into a monospaced Telegram-safe block."""
         lines = m.group(0).strip().splitlines()
         if len(lines) < 3: return m.group(0)
         # Parse rows
@@ -174,6 +179,7 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # 7. Handle alerts (> [!NOTE] ...)
     def _alert_sub(m: re.Match[str]) -> str:
+        """Convert GitHub-style alert blocks into Telegram-safe HTML."""
         kind = m.group(1).upper()
         content = m.group(2)
         icons = {"NOTE": "ℹ️ <b>Catatan</b>", "TIP": "💡 <b>Tips</b>", 
@@ -190,6 +196,7 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # 7.5. Handle blockquotes (> Quote, escaped to &gt;)
     def _blockquote_sub(m: re.Match[str]) -> str:
+        """Convert markdown blockquotes into Telegram-safe HTML."""
         lines = m.group(0).splitlines()
         content = "\n".join(re.sub(r"^&gt;\s?", "", l) for l in lines)
         if len(lines) > 6 or content.startswith("!"):
@@ -235,6 +242,7 @@ def markdown_to_telegram_html(text: str) -> str:
     
     # 13.5. Light Math / LaTeX (convert to unicode wrapped in italic)
     def _math_sub(m: re.Match[str]) -> str:
+        """Convert math notation into Telegram-safe HTML."""
         s = m.group(1)
         s = s.replace("\\approx", "≈").replace("\\infty", "∞").replace("\\in", "∈")
         s = s.replace("\\to", "→").replace("\\pi", "π").replace("\\theta", "θ")
@@ -265,6 +273,7 @@ def sanitize_markdown_for_telegram(text: str) -> str:
         return ""
 
     def _header_sub(m: re.Match[str]) -> str:
+        """Convert markdown headers to bold Telegram-safe HTML."""
         level = len(m.group(1))
         title = m.group(2).strip()
         icon = "🔹" if level > 2 else "📌"
@@ -330,6 +339,7 @@ InlineKeyboard = list[list[dict[str, Any]]]
 
 
 def parse_update(update: dict[str, Any]) -> InboundMessage | None:
+    """Parse a Telegram update into an InboundMessage, or None if not a message."""
     msg = update.get("message")
     if not isinstance(msg, dict):
         return None
@@ -360,6 +370,7 @@ def parse_update(update: dict[str, Any]) -> InboundMessage | None:
 
 
 def parse_callback_query(update: dict[str, Any]) -> CallbackQuery | None:
+    """Parse a Telegram update into a CallbackQuery, or None if not applicable."""
     cq = update.get("callback_query")
     if not isinstance(cq, dict):
         return None
@@ -392,20 +403,24 @@ def parse_callback_query(update: dict[str, Any]) -> CallbackQuery | None:
 
 
 def is_authorized_user(user_id: int, cfg: TelegramConfig) -> bool:
+    """True when the user id is in the configured allowlist."""
     return user_id in cfg.allowed_user_ids
 
 
 def is_authorized_chat(chat_id: int, cfg: TelegramConfig) -> bool:
+    """True when chat filtering is disabled or the chat is allowed."""
     return not cfg.allowed_chat_ids or chat_id in cfg.allowed_chat_ids
 
 
 def is_authorized(msg: InboundMessage, cfg: TelegramConfig) -> bool:
+    """True when both the user and the chat pass the allowlists."""
     if not is_authorized_user(msg.user_id, cfg):
         return False
     return is_authorized_chat(msg.chat_id, cfg)
 
 
 def chunk_message(text: str, max_len: int = 4096) -> list[str]:
+    """Split text into chunks within Telegram's message length limit."""
     if not text:
         return []
     if len(text) <= max_len:
@@ -460,6 +475,7 @@ class TelegramClient:
         self._client = None
 
     async def get_me(self) -> dict[str, Any]:
+        """Fetch bot metadata via getMe."""
         assert self._client is not None
         r = await self._client.get(f"{self._base}/getMe")
         data = r.json()
@@ -468,6 +484,7 @@ class TelegramClient:
         return dict(data.get("result") or {})
 
     async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]:
+        """Long-poll Telegram for new updates."""
         assert self._client is not None
         r = await self._client.get(f"{self._base}/getUpdates", params={
             "offset": offset,
@@ -487,6 +504,7 @@ class TelegramClient:
         keyboard: InlineKeyboard | None = None,
         parse_mode: str | None = "HTML",
     ) -> int | None:
+        """Send text (auto-chunked) and return the first message id."""
         assert self._client is not None
         first_message_id: int | None = None
 
@@ -534,6 +552,7 @@ class TelegramClient:
         keyboard: InlineKeyboard | None = None,
         parse_mode: str | None = "HTML",
     ) -> None:
+        """Edit an existing message's text/keyboard in place."""
         assert self._client is not None
         effective_mode = parse_mode
         if effective_mode == "HTML":
@@ -602,6 +621,7 @@ class TelegramClient:
         *,
         text: str = "",
     ) -> None:
+        """Acknowledge a callback query with an optional toast."""
         assert self._client is not None
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}
         if text:
@@ -612,6 +632,7 @@ class TelegramClient:
             return
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Send a chat action such as the typing indicator."""
         assert self._client is not None
         r = await self._client.post(
             f"{self._base}/sendChatAction",
@@ -622,6 +643,7 @@ class TelegramClient:
             raise RuntimeError(f"sendChatAction failed: {data.get('description')}")
 
     async def get_file(self, file_id: str) -> bytes:
+        """Download a file by file_id and return its bytes."""
         assert self._client is not None
         r = await self._client.get(f"{self._base}/getFile", params={"file_id": file_id})
         data = r.json()
@@ -638,6 +660,7 @@ class TelegramClient:
         *,
         scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Register the bot command menu (optionally scoped)."""
         assert self._client is not None
         payload: dict[str, Any] = {"commands": commands}
         if scope is not None:
@@ -646,6 +669,7 @@ class TelegramClient:
         return r.json()
 
     async def set_webhook(self, url: str, secret_token: str = "") -> dict[str, Any]:
+        """Register a webhook endpoint for incoming updates."""
         assert self._client is not None
         params: dict[str, Any] = {"url": url}
         if secret_token:
@@ -660,6 +684,7 @@ class TelegramClient:
         *,
         caption: str = "",
     ) -> int | None:
+        """Upload a document to the chat; returns the message id."""
         assert self._client is not None
         p = Path(file_path)
         if not p.is_file():
@@ -696,6 +721,7 @@ class TelegramClient:
             raise RuntimeError(f"deleteMessage failed: {data.get('description')}")
 
     async def delete_webhook(self) -> dict[str, Any]:
+        """Remove the webhook registration."""
         assert self._client is not None
         r = await self._client.get(f"{self._base}/deleteWebhook")
         return r.json()

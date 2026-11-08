@@ -748,3 +748,106 @@ async def test_run_records_usage_in_state(
     assert cs.usage_total_turns == 1
     assert cs.usage_last_in == 100
     assert cs.usage_today_tokens == 105
+
+
+# ── Review round 2: bounded shutdown + audible accounting failures ────────
+
+
+async def test_run_shutdown_bounds_stuck_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown must not hang forever if the worker ignores cancellation."""
+    import logging
+
+    import src.daemon as daemon_mod
+    from src.state import State
+
+    loop = asyncio.get_running_loop()
+    ignore_until = loop.time() + 1.0  # stuck in cleanup for ~1s, then gives up
+
+    async def stuck_worker(*args: Any, **kwargs: Any) -> None:
+        while loop.time() < ignore_until:
+            try:
+                await asyncio.sleep(max(0.0, ignore_until - loop.time()))
+            except asyncio.CancelledError:
+                continue  # ignores cancellation during the stuck window
+
+    monkeypatch.setattr(daemon_mod, "_turn_worker", stuck_worker)
+    monkeypatch.setattr(daemon_mod, "_WORKER_SHUTDOWN_TIMEOUT_S", 0.3)
+
+    tg = _FakeTelegram(updates_to_serve=[], sent_messages=[], chat_actions=[])
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, stop.set)
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture()
+    daemon_mod.LOG.addHandler(handler)
+    daemon_mod.LOG.setLevel(logging.INFO)
+    try:
+        await asyncio.wait_for(run(
+            cfg=_cfg(), state_path=tmp_path / "state.json",
+            chats_root=tmp_path / "chats", tg=tg, agy_path="/usr/bin/true",
+            info=DaemonInfo(bot_username="@bot", started_at=0.0, agy_version="1.0"),
+            stop_event=stop,
+        ), timeout=5)
+    finally:
+        daemon_mod.LOG.removeHandler(handler)
+
+    assert any("did not exit" in r.message for r in captured), (
+        "shutdown must warn when the worker exceeds the cancellation wait bound"
+    )
+
+
+async def test_usage_accounting_failure_logs_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+
+    import src.daemon as daemon_mod
+    from src.turn import TurnOutput
+
+    async def fake_agy(*args: Any, **kwargs: Any) -> TurnOutput:
+        return TurnOutput("echo:hi", 0, usage={
+            "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+        })
+
+    monkeypatch.setattr("src.daemon.execute_agy", fake_agy)
+
+    def boom(cs: Any, usage: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("src.daemon._record_usage", boom)
+
+    tg = _FakeTelegram(
+        updates_to_serve=[[_msg("hi", update_id=110)]],
+        sent_messages=[], chat_actions=[],
+    )
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.4, stop.set)
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture()
+    daemon_mod.LOG.addHandler(handler)
+    daemon_mod.LOG.setLevel(logging.INFO)
+    try:
+        await run(
+            cfg=_cfg(), state_path=tmp_path / "state.json",
+            chats_root=tmp_path / "chats", tg=tg, agy_path="/usr/bin/true",
+            info=DaemonInfo(bot_username="@bot", started_at=0.0, agy_version="1.0"),
+            stop_event=stop,
+        )
+    finally:
+        daemon_mod.LOG.removeHandler(handler)
+
+    assert any("usage accounting failed" in r.message and "disk full" in r.message
+               for r in captured), "accounting failures must not be silent"
