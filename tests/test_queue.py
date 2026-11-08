@@ -59,10 +59,12 @@ def test_complete_clears_active_flag_only_when_queue_empty() -> None:
     q = TurnQueue()
     q.submit(_m(chat_id=1, update_id=1))
     q.submit(_m(chat_id=2, update_id=2))
-    q.complete()  # item 2 still pending → still active
+    q._q.get_nowait()  # worker takes item 1 (in-flight)
+    q.complete()       # item 2 still pending → still active
     assert q.active is True
     q._q.get_nowait()
-    q._q.get_nowait()
+    q.task_done()
+    q.task_done()
     q.complete()
     assert q.active is False
 
@@ -121,3 +123,27 @@ def test_check_ratelimit_sliding_window_per_user() -> None:
     # Another user is unaffected
     ok_other, _ = q.check_ratelimit(2)
     assert ok_other
+
+
+async def test_submit_position_counts_inflight_turn() -> None:
+    """A message queued while a turn is executing must be position #1, not #0."""
+    q = TurnQueue()
+    assert q.submit(_m(chat_id=1, update_id=1)) is None
+    await asyncio.wait_for(q.get(), timeout=1)  # worker picks it up → in-flight, qsize=0
+    status = q.submit(_m(chat_id=2, update_id=2))
+    assert status is not None
+    assert "#1" in status, f"first waiting message must be position #1, got: {status}"
+
+
+async def test_position_advances_and_decrements_through_cycle() -> None:
+    q = TurnQueue()
+    q.submit(_m(chat_id=1, update_id=1))
+    q.submit(_m(chat_id=2, update_id=2))
+    status3 = q.submit(_m(chat_id=3, update_id=3))
+    assert status3 is not None and "#2" in status3
+    # Drain everything: counter must reach zero so positions restart at #1.
+    for _ in range(3):
+        await asyncio.wait_for(q.get(), timeout=1)
+        q.task_done()
+    q.complete()
+    assert q.submit(_m(chat_id=4, update_id=4)) is None  # queue idle again

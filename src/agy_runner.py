@@ -12,10 +12,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
+
+LOG = logging.getLogger("antigravity_telegram_bridge")
+
+# Bounded wait after proc.kill() so a wedged child cannot hang the caller.
+_KILL_WAIT_S = 5.0
 
 # Safety cap on stdout capture — prevents unbounded memory growth from
 # runaway agy output. 1MB is generous (typical replies are 1–5KB).
@@ -24,6 +30,9 @@ _STDOUT_CAP_BYTES = 524_288  # 512 KiB
 # Reap any defunct child processes left by prior subprocess invocations
 # (bwrap sandbox can leave orphaned grand-children).
 def _reap_zombies() -> None:
+    """Reap defunct child processes left by prior subprocess runs (POSIX only)."""
+    if not hasattr(os, "WNOHANG"):
+        return  # POSIX-only API; Windows has no fork() and thus no zombies
     try:
         while True:
             pid, _status = os.waitpid(-1, os.WNOHANG)
@@ -38,6 +47,9 @@ class AgyResult:
     text: str
     exit_code: int
     stderr: str
+    # Token usage reported by the stream-json result event (None on
+    # abort/timeout/error paths).
+    usage: dict[str, int] | None = None
 
 
 _ACTIVE_PROC: dict[str, Any] = {}
@@ -56,12 +68,31 @@ def abort_turn(chat_dir: str) -> bool:
 
 
 # Base model prefix -> (supported effort suffixes, default effort).
-# agy rejects these base IDs without an effort (e.g. "--model claude-sonnet-5-5
-# requires --effort (available: low, medium, high)"), so the bridge appends one.
+# Effort is expressed through the model ID itself: these bases get a suffix
+# appended (e.g. "gemini-3.8-flash" + "high" -> "gemini-3.8-flash-high").
 _EFFORT_SUFFIX_MODELS: dict[str, tuple[tuple[str, ...], str]] = {
     "gemini-3.8": (("low", "medium", "high"), "low"),
 }
 _EFFORT_SUFFIXES: tuple[str, ...] = ("-low", "-medium", "-high", "-max")
+
+# Model IDs that accept a standalone --effort flag at launch. None in the
+# current agy catalog: suffixed IDs reject a conflicting flag
+# ("--model gemini-3.8-flash-low conflicts with --effort=high") and Claude
+# models reject any flag ("--effort is not supported for model ...").
+# Kept as a hook for future models exposing a bare ID + --effort.
+_STANDALONE_EFFORT_MODELS: frozenset[str] = frozenset()
+
+
+def model_uses_effort(model: str) -> bool:
+    """True when cs.effort influences the launched model ID.
+
+    Only the composable bases listed in _EFFORT_SUFFIX_MODELS consume the
+    per-chat effort; IDs with a baked-in suffix or families without effort
+    support (Claude) ignore it.
+    """
+    if not model or model.endswith(_EFFORT_SUFFIXES):
+        return False
+    return any(model.startswith(prefix) for prefix in _EFFORT_SUFFIX_MODELS)
 
 
 def _resolve_model_args(model: str, effort: str) -> list[str]:
@@ -83,7 +114,9 @@ def _resolve_model_args(model: str, effort: str) -> list[str]:
     args: list[str] = []
     if model:
         args.extend(["--model", model])
-    if effort:
+    # Never emit --effort unless the model family actually accepts it: agy
+    # rejects the whole turn otherwise (verified against the live CLI).
+    if effort and model in _STANDALONE_EFFORT_MODELS:
         args.extend(["--effort", effort])
     return args
 
@@ -99,6 +132,7 @@ def _build_args(
     chat_dir: str = "",
     effort: str = "",
 ) -> list[str]:
+    """Build the agy CLI argv for one print-mode turn."""
     import shutil
     resolved_agy = shutil.which(agy_path) or agy_path
     args = [resolved_agy, "-p", prompt]
@@ -223,9 +257,11 @@ async def run_agy(
     plain_text_lines: list[str] = []
     final_response = ""
     result_error = ""
+    result_usage: dict[str, int] | None = None
 
     async def _read_stdout() -> None:
-        nonlocal final_response, result_error
+        """Consume agy stdout: capture the result event and forward stream events to on_event."""
+        nonlocal final_response, result_error, result_usage
         if proc.stdout is None:
             return
         async for raw_line in proc.stdout:
@@ -240,6 +276,8 @@ async def run_agy(
                         res = data.get("result", {})
                         final_response = res.get("response", "")
                         result_error = res.get("error", "")
+                        usage = res.get("usage")
+                        result_usage = usage if isinstance(usage, dict) else None
                     if on_event is not None:
                         cb_res = on_event(data)
                         if asyncio.iscoroutine(cb_res):
@@ -250,6 +288,7 @@ async def run_agy(
             plain_text_lines.append(line)
 
     async def _read_stderr() -> str:
+        """Read agy stderr to completion and return it as text."""
         if proc.stderr is None:
             return ""
         raw = await proc.stderr.read()
@@ -271,6 +310,31 @@ async def run_agy(
             except Exception:
                 pass
         return AgyResult(text="", exit_code=124, stderr=f"agy timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # Cancellation must not orphan the child: stop it and wait for it to
+        # exit BEFORE dropping the registry entry, then re-raise. Bounded so a
+        # wedged child or a repeated cancellation cannot hang the caller.
+        if proc:
+            try:
+                proc.kill()
+            except Exception as exc:
+                LOG.warning("failed to kill agy child chat_dir=%s: %s", chat_dir, exc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_KILL_WAIT_S)
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "agy child chat_dir=%s still alive %ss after kill",
+                    chat_dir, _KILL_WAIT_S,
+                )
+            except asyncio.CancelledError:
+                LOG.warning(
+                    "run_agy cleanup interrupted by repeated cancellation chat_dir=%s",
+                    chat_dir,
+                )
+                raise
+            except Exception as exc:
+                LOG.warning("failed waiting for agy child chat_dir=%s: %s", chat_dir, exc)
+        raise
     except Exception as exc:
         if proc:
             try:
@@ -300,4 +364,5 @@ async def run_agy(
         text=text,
         exit_code=exit_code,
         stderr=stderr_out,
+        usage=result_usage,
     )

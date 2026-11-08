@@ -12,12 +12,14 @@ LOG_FILE = Path.home() / ".antigravity" / "bridge" / "logs" / "bridge.log"
 
 
 def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    """Run a systemctl --user command for the bridge service."""
     return subprocess.run(
         ["systemctl", "--user", *args],
         capture_output=True, text=True, check=False)
 
 
 def _action_start() -> dict[str, Any]:
+    """Handle the bridge start action."""
     res = _systemctl("start", SERVICE)
     ok = res.returncode == 0
     return {"ok": ok,
@@ -25,18 +27,21 @@ def _action_start() -> dict[str, Any]:
 
 
 def _action_stop() -> dict[str, Any]:
+    """Handle the bridge stop action."""
     res = _systemctl("stop", SERVICE)
     return {"ok": res.returncode == 0,
             "output": (res.stdout + res.stderr).strip() or "stopped"}
 
 
 def _action_status() -> dict[str, Any]:
+    """Handle the bridge status action."""
     res = _systemctl("status", SERVICE, "--no-pager")
     return {"ok": res.returncode in (0, 3),
             "output": (res.stdout + res.stderr).strip()}
 
 
 def _action_logs(lines: int = 50) -> dict[str, Any]:
+    """Handle the bridge logs action."""
     if LOG_FILE.exists():
         text = LOG_FILE.read_text(errors="replace").splitlines()
         return {"ok": True, "output": "\n".join(text[-lines:])}
@@ -48,10 +53,12 @@ def _action_logs(lines: int = 50) -> dict[str, Any]:
 
 
 def _cfg_path() -> Path:
+    """Resolve the config.json path used by the plugin tool."""
     return Path(__file__).resolve().parent.parent / "config.json"
 
 
 def _check_config(report: list[str]) -> Any:
+    """Verify config.json exists and parses."""
     try:
         from src.config import load_config
         return load_config(_cfg_path())
@@ -61,6 +68,7 @@ def _check_config(report: list[str]) -> Any:
 
 
 def _check_agy(report: list[str]) -> None:
+    """Verify the agy binary is resolvable."""
     try:
         k = subprocess.run(["agy", "--version"], capture_output=True, text=True, check=False)
         if k.returncode == 0:
@@ -74,6 +82,7 @@ def _check_agy(report: list[str]) -> None:
 def _check_agy_auth(report: list[str]) -> None:
     # agy stores auth under ~/.gemini/antigravity-cli/. A lightweight proxy is
     # the presence of the app data dir plus an installation id.
+    """Verify agy has an authenticated session."""
     auth_dir = Path.home() / ".gemini" / "antigravity-cli"
     if auth_dir.exists():
         report.append(f"✓ agy auth dir exists ({auth_dir})")
@@ -84,6 +93,7 @@ def _check_agy_auth(report: list[str]) -> None:
 
 
 def _check_telegram(report: list[str], bot_token: str) -> None:
+    """Verify Telegram credentials are configured."""
     try:
         import httpx
         r = httpx.get(f"https://api.telegram.org/bot{bot_token}/getMe", timeout=10)
@@ -111,6 +121,7 @@ def _check_telegram(report: list[str], bot_token: str) -> None:
 
 
 def _action_setup() -> dict[str, Any]:
+    """Run the interactive setup checks for the plugin tool."""
     report = [f"config: {_cfg_path()}"]
     cfg = _check_config(report)
     if cfg is None:
@@ -123,6 +134,7 @@ def _action_setup() -> dict[str, Any]:
 
 
 def handle(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch a plugin-tool action payload to its handler."""
     action = payload.get("action")
     handlers = {"start": _action_start, "stop": _action_stop,
                 "status": _action_status, "setup": _action_setup}
@@ -135,6 +147,7 @@ def handle(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:  # pragma: no cover
+    """CLI entry point for the bridge plugin tool."""
     import logging
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

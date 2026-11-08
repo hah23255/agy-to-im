@@ -29,6 +29,7 @@ CONCEPTS_DIR = "concepts"
 
 
 def _okf_timestamp() -> str:
+    """Return the OKF timestamp string used in memory files."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 

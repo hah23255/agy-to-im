@@ -36,6 +36,7 @@ class TurnQueue:
     active: bool = False
     _q: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False, compare=False)
     _limits: dict[int, RateLimit] = field(default_factory=dict, repr=False, compare=False)
+    _pending: int = 0  # submitted but not yet task_done — includes the in-flight turn
 
     def submit(self, msg: "InboundMessage") -> str | None:
         """Enqueue a message for processing. Returns None when the worker will
@@ -50,8 +51,9 @@ class TurnQueue:
         self._q.put_nowait(msg)
         # A turn is now pending or executing until the worker completes it.
         self.active = True
+        self._pending += 1
         if busy:
-            return f"⏳ Queued (position #{self._q.qsize() - 1}). Processing soon…"
+            return f"⏳ Queued (position #{self._pending - 1}). Processing soon…"
         return None
 
     async def get(self) -> "InboundMessage":
@@ -61,23 +63,27 @@ class TurnQueue:
     def task_done(self) -> None:
         """Worker-side: mark the item taken via get() as fully processed."""
         self._q.task_done()
+        if self._pending > 0:
+            self._pending -= 1
 
     async def join(self) -> None:
         """Wait until every submitted item has been processed (graceful drain)."""
         await self._q.join()
 
     def qsize(self) -> int:
+        """Number of items parked in the FIFO (excludes the in-flight turn)."""
         return self._q.qsize()
 
     def complete(self) -> None:
         """Clear the active flag once nothing is pending or executing."""
-        if self._q.qsize() == 0:
+        if self._q.qsize() == 0 and self._pending == 0:
             self.active = False
 
     def reset(self) -> None:
         """Drop all queued messages and bookkeeping (used at daemon startup)."""
         self.active = False
         self._limits.clear()
+        self._pending = 0
         self._q = asyncio.Queue()
 
     def check_ratelimit(self, user_id: int) -> tuple[bool, int]:
@@ -94,9 +100,15 @@ class TurnQueue:
         return True, 0
 
     def status(self) -> list[str]:
+        """Render the queue state lines for /queue display."""
         lines = [f"Active: {'yes' if self.active else 'no'}"]
         if self._q.qsize():
             lines.append(f"Queue depth: {self._q.qsize()}")
         else:
             lines.append("Queue: empty")
         return lines
+
+
+# Shared singleton — lives here (not in src.daemon) so that /queue and the
+# worker observe the same object even when the daemon runs as __main__.
+QUEUE = TurnQueue()

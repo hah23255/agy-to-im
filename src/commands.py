@@ -9,10 +9,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 from typing import TYPE_CHECKING
 import yaml
 
+from src.agy_runner import model_uses_effort
 from src.media import clean_inbox, list_inbox
+from src.queue import QUEUE
 from src.state import is_valid_model
 from src.telegram import InlineKeyboard
 
@@ -97,6 +100,7 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "mcp", "description": "View and manage MCP servers and tools"},
     {"command": "skills", "description": "List and inspect available skills"},
     {"command": "queue", "description": "Turn queue status"},
+    {"command": "usage", "description": "Token usage for this chat"},
 ]
 
 
@@ -111,6 +115,7 @@ class BridgeReply:
 
 
 def _effective_model(cs: "ChatState", cfg: "Config") -> tuple[str, str]:
+    """Return the chat's model override or the config default."""
     if cs.model:
         return cs.model, "chat"
     if cfg.agy.model:
@@ -119,12 +124,14 @@ def _effective_model(cs: "ChatState", cfg: "Config") -> tuple[str, str]:
 
 
 def _effective_mode(cs: "ChatState", cfg: "Config") -> tuple[str, str]:
+    """Return the chat's mode override or the config default."""
     if cs.mode:
         return cs.mode, "chat"
     return cfg.agy.mode, "config"
 
 
 def render_status(cs: "ChatState", cfg: "Config") -> str:
+    """Render the /status summary for a chat."""
     model, model_src = _effective_model(cs, cfg)
     mode, mode_src = _effective_mode(cs, cfg)
     effort = getattr(cs, "effort", "") or "default"
@@ -147,6 +154,7 @@ def render_status(cs: "ChatState", cfg: "Config") -> str:
 
 
 def _settings_keyboard(cs: "ChatState") -> InlineKeyboard:
+    """Build the inline keyboard for the /settings panel."""
     power_label = "🔴 Turn Off" if cs.active else "🟢 Turn On"
     return [
         [
@@ -169,6 +177,7 @@ def _settings_keyboard(cs: "ChatState") -> InlineKeyboard:
 
 
 def _model_keyboard(current_per_chat: str) -> InlineKeyboard:
+    """Build the inline keyboard listing selectable models."""
     rows: InlineKeyboard = []
     for model_id, label, _ in BASE_MODELS:
         is_active = (current_per_chat == model_id) or current_per_chat.startswith(f"{model_id}-")
@@ -183,6 +192,7 @@ def _model_keyboard(current_per_chat: str) -> InlineKeyboard:
 
 
 def _model_effort_keyboard(current_effort: str, supported_efforts: tuple[str, ...]) -> InlineKeyboard:
+    """Build the inline keyboard for choosing a composable model's effort."""
     cells: list[dict[str, object]] = []
     for val in supported_efforts:
         marker = "● " if val == current_effort else "○ "
@@ -206,6 +216,7 @@ def _render_model_effort_picker(
     cfg: "Config",
     toast: str = "",
 ) -> BridgeReply:
+    """Render the effort sub-picker for a composable model base."""
     label = model_id
     efforts: tuple[str, ...] = EFFORT_CHOICES
     for mid, mlabel, mefforts in BASE_MODELS:
@@ -223,6 +234,7 @@ def _render_model_effort_picker(
 
 
 def _mode_keyboard(current_per_chat: str) -> InlineKeyboard:
+    """Build the inline keyboard for mode selection."""
     cells: list[dict[str, object]] = []
     for value, label in MODE_CHOICES:
         marker = "● " if value == current_per_chat else "○ "
@@ -236,6 +248,7 @@ def _mode_keyboard(current_per_chat: str) -> InlineKeyboard:
 
 
 def _effort_keyboard(current_per_chat: str) -> InlineKeyboard:
+    """Build the inline keyboard for effort selection."""
     cells: list[dict[str, object]] = []
     for val in EFFORT_CHOICES:
         marker = "● " if val == current_per_chat else "○ "
@@ -249,10 +262,12 @@ def _effort_keyboard(current_per_chat: str) -> InlineKeyboard:
 
 
 def _render_settings(cs: "ChatState", cfg: "Config") -> BridgeReply:
+    """Render the settings panel text for the current chat state."""
     return BridgeReply(text=render_status(cs, cfg), keyboard=_settings_keyboard(cs))
 
 
 def _render_model_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
+    """Render the model picker reply."""
     cur, src = _effective_model(cs, cfg)
     return BridgeReply(
         text=f"🤖 Choose a model for this chat\n\nCurrent: {cur}  [{src}]",
@@ -261,6 +276,7 @@ def _render_model_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
 
 
 def _render_mode_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
+    """Render the mode picker reply."""
     cur, src = _effective_mode(cs, cfg)
     return BridgeReply(
         text=f"🛡 Choose a mode for this chat\n\nCurrent: {cur}  [{src}]",
@@ -269,6 +285,7 @@ def _render_mode_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
 
 
 def _render_effort_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
+    """Render the effort picker reply."""
     cur = getattr(cs, "effort", "") or "default"
     return BridgeReply(
         text=f"⚡ Choose reasoning effort for this chat\n\nCurrent: {cur}",
@@ -328,6 +345,7 @@ def _get_mcp_tools(server_name: str) -> list[dict[str, str]]:
 
 
 def _render_mcp_reply(args: str) -> BridgeReply:
+    """Render the /mcp reply from the chat's MCP inventory."""
     args = args.strip()
     if args.startswith("enable ") or args.startswith("disable "):
         sub, name = args.split(maxsplit=1)
@@ -427,6 +445,7 @@ def _list_skills(workspace_dir: str = "") -> list[dict[str, str]]:
 
 
 def _render_skills_reply(args: str, cs: ChatState) -> BridgeReply:
+    """Render the /skills reply from the available skills list."""
     skills = _list_skills(cs.chat_dir)
     if not skills:
         return BridgeReply("🧠 No skills discovered.")
@@ -499,6 +518,10 @@ async def handle_text_command(
         if args:
             if is_valid_model(args):
                 cs.model = args
+                # Keep effort state coherent: it only applies to models that
+                # consume it, so a stale value must not linger on Claude etc.
+                if not model_uses_effort(args):
+                    cs.effort = ""
                 return BridgeReply(f"🤖 Model set to {args}")
             return BridgeReply(f"⚠️ Unsupported model: {args}")
         return _render_model_picker(cs, cfg)
@@ -592,10 +615,23 @@ async def handle_text_command(
             return BridgeReply("📭 Inbox is empty")
         return BridgeReply("📎 Inbox:\n" + "\n".join(f"• {f}" for f in files))
     if cmd == "/queue":
-        from src.daemon import _QUEUE  # lazy import avoids a circular import
-
-        lines = _QUEUE.status()
+        lines = QUEUE.status()
         return BridgeReply("📋 Turn queue\n" + "\n".join(f"• {line}" for line in lines))
+    if cmd == "/usage":
+        today = time.strftime("%Y-%m-%d")
+        tokens_today = cs.usage_today_tokens if cs.usage_today_date == today else 0
+        turns_today = cs.usage_today_turns if cs.usage_today_date == today else 0
+        if not cs.usage_total_turns and not cs.usage_last_total:
+            return BridgeReply("📊 Belum ada data usage untuk chat ini.")
+        lines = ["📊 Usage agy (chat ini)"]
+        if cs.usage_last_total:
+            lines.append(
+                f"• Turn terakhir: {cs.usage_last_in:,} in / {cs.usage_last_out:,} out"
+                f" — {cs.usage_last_total:,} token"
+            )
+        lines.append(f"• Hari ini: {tokens_today:,} token ({turns_today} turn)")
+        lines.append(f"• Total: {cs.usage_total_tokens:,} token ({cs.usage_total_turns} turn)")
+        return BridgeReply("\n".join(lines))
     if cmd in ("/getfile", "/sendfile", "/download"):
         if not args:
             return BridgeReply("⚠️ Usage: /getfile <filename>")
@@ -673,6 +709,8 @@ def handle_callback(
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
         elif choice in MODEL_CHOICES or is_valid_model(choice):
             cs.model = choice
+            if not model_uses_effort(choice):
+                cs.effort = ""  # stale effort would be inert on this model
             model_info = next((m for m in BASE_MODELS if m[0] == choice), None)
             if model_info and model_info[2]:
                 return _render_model_effort_picker(choice, cs, cfg, toast=f"Model: {choice}")

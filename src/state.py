@@ -17,6 +17,9 @@ from pathlib import Path
 # no '..'). Real chat_ids are integers, so the dir name is the stringified id.
 _CHAT_DIR_RE = re.compile(r"^-?[0-9]+$")
 
+# YYYY-MM-DD key for the per-chat daily usage window.
+_USAGE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 # Per-chat overrides have to be argv-safe. The regex rejects any character
 # that's not strictly needed for valid model identifiers (e.g. "gemini-3.5-flash").
 # Crucially it forbids a leading `-` so a tampered state file can't inject flags.
@@ -37,6 +40,15 @@ class ChatState:
     style_hint: bool = True  # toggle for Telegram specific prompt hints
     turn_count: int = 0  # successful turns served on this chat
     active: bool = True  # False → bot ignores non-command messages
+    # Token usage accounting (from agy stream-json result events).
+    usage_last_in: int = 0  # input tokens of the last completed turn
+    usage_last_out: int = 0  # output tokens of the last completed turn
+    usage_last_total: int = 0  # total tokens of the last completed turn
+    usage_today_tokens: int = 0  # tokens accumulated today (local time)
+    usage_today_turns: int = 0  # turns counted today
+    usage_today_date: str = ""  # YYYY-MM-DD window key for the daily counters
+    usage_total_tokens: int = 0  # lifetime token total for this chat
+    usage_total_turns: int = 0  # lifetime turn count for this chat
 
 
 @dataclass
@@ -46,35 +58,48 @@ class State:
 
 
 def is_valid_model(name: str) -> bool:
+    """True when a model id is argv-safe (no leading dash, allowed charset)."""
     return bool(name) and bool(_MODEL_RE.match(name))
 
 
 def _safe_model(raw: object) -> str:
+    """Return the raw model id if argv-safe, else an empty string."""
     if not isinstance(raw, str) or not raw:
         return ""
     return raw if _MODEL_RE.match(raw) else ""
 
 
 def _safe_mode(raw: object) -> str:
+    """Return the mode if allowed, else an empty string."""
     if isinstance(raw, str) and raw in _ALLOWED_MODES:
         return raw
     return ""
 
 
 def _safe_turn_count(raw: object) -> int:
+    """Return the int if a non-negative integer, else 0."""
     if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
         return raw
     return 0
 
 
 def _safe_bool(raw: object) -> bool:
+    """Return the bool as-is; anything else defaults to True."""
     if isinstance(raw, bool):
         return raw
     return True
 
 
 def _safe_effort(raw: object) -> str:
+    """Return the effort if allowed, else an empty string."""
     if isinstance(raw, str) and raw in _ALLOWED_EFFORTS:
+        return raw
+    return ""
+
+
+def _safe_usage_date(raw: object) -> str:
+    """Return a well-formed YYYY-MM-DD string, else an empty string."""
+    if isinstance(raw, str) and _USAGE_DATE_RE.match(raw):
         return raw
     return ""
 
@@ -84,6 +109,7 @@ def _safe_chat_state(
     raw: dict,
     extra_allowed_dirs: list[Path] | None = None,
 ) -> ChatState | None:
+    """Validate and build a ChatState from raw JSON, or None if unsafe."""
     chat_dir = raw.get("chat_dir")
     if not isinstance(chat_dir, str):
         return None
@@ -125,6 +151,14 @@ def _safe_chat_state(
         style_hint=_safe_bool(raw.get("style_hint", True)),
         turn_count=_safe_turn_count(raw.get("turn_count", 0)),
         active=_safe_bool(raw.get("active", True)),
+        usage_last_in=_safe_turn_count(raw.get("usage_last_in", 0)),
+        usage_last_out=_safe_turn_count(raw.get("usage_last_out", 0)),
+        usage_last_total=_safe_turn_count(raw.get("usage_last_total", 0)),
+        usage_today_tokens=_safe_turn_count(raw.get("usage_today_tokens", 0)),
+        usage_today_turns=_safe_turn_count(raw.get("usage_today_turns", 0)),
+        usage_today_date=_safe_usage_date(raw.get("usage_today_date", "")),
+        usage_total_tokens=_safe_turn_count(raw.get("usage_total_tokens", 0)),
+        usage_total_turns=_safe_turn_count(raw.get("usage_total_turns", 0)),
     )
 
 
@@ -133,6 +167,7 @@ def load_state(
     chats_root: Path,
     extra_allowed_dirs: list[Path] | None = None,
 ) -> State:
+    """Load chat state from disk, dropping malformed entries."""
     if not path.exists():
         return State()
     try:
@@ -158,6 +193,7 @@ def load_state(
 
 
 def save_state(path: Path, state: State) -> None:
+    """Atomically persist chat state to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = {

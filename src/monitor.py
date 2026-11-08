@@ -261,6 +261,7 @@ class TurnMonitor:
                 self._timer_task = asyncio.create_task(self._delayed_push(delay))
 
     async def _delayed_push(self, delay: float) -> None:
+        """Push a pending update once the throttle delay elapses."""
         try:
             await asyncio.sleep(delay)
             if self._pending_update and not self._finished:

@@ -20,16 +20,19 @@ _RSS_PATH = "/proc/self/statm"
 
 
 def record_turn() -> None:
+    """Increment the successful-turn counter."""
     global _turns_total
     _turns_total += 1
 
 
 def record_error() -> None:
+    """Increment the error counter."""
     global _errors_total
     _errors_total += 1
 
 
 def record_latency(ms: float) -> None:
+    """Record a turn latency sample."""
     _turn_latencies.append(ms)
     # Rotate at 100 entries — retain recent history without unbounded growth
     if len(_turn_latencies) > 100:
@@ -55,6 +58,7 @@ def memory_healthy() -> bool:
 
 
 def _health_body() -> bytes:
+    """Build the /health JSON payload."""
     rss = _read_rss_bytes()
     return json.dumps({
         "status": "ok",
@@ -68,6 +72,7 @@ def _health_body() -> bytes:
 
 
 def _metrics_body() -> bytes:
+    """Build the Prometheus /metrics payload."""
     lines = [
         "# HELP bridge_turns_total Total turns processed",
         "# TYPE bridge_turns_total counter",
@@ -93,6 +98,7 @@ def _metrics_body() -> bytes:
 
 
 async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Serve /health and /metrics requests."""
     try:
         req = (await asyncio.wait_for(reader.readuntil(b"\r\n"), 5)).decode().strip()
     except (asyncio.TimeoutError, ValueError):
@@ -123,4 +129,5 @@ async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -
 
 
 async def start_server(host: str = HEALTH_HOST, port: int = HEALTH_PORT) -> asyncio.AbstractServer:
+    """Start the health/metrics HTTP server."""
     return await asyncio.start_server(_handler, host, port)

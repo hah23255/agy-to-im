@@ -186,8 +186,10 @@ def test_build_args_effort() -> None:
         chat_dir="/tmp/test",
         effort="high",
     )
-    assert "--effort" in args
-    assert "high" in args
+    # agy rejects a standalone --effort when no effort-capable model is
+    # selected (default model conflicts with it), so nothing may be emitted.
+    assert "--effort" not in args
+    assert "high" not in args
 
 
 @pytest.mark.parametrize(
@@ -198,10 +200,15 @@ def test_build_args_effort() -> None:
         ("gemini-3.8-flash", "high", ["--model", "gemini-3.8-flash-high"]),
         ("gemini-3.8-flash", "max", ["--model", "gemini-3.8-flash-high"]),
         ("claude-sonnet-4-6", "", ["--model", "claude-sonnet-4-6"]),
-        ("claude-sonnet-4-6", "high", ["--model", "claude-sonnet-4-6", "--effort", "high"]),
+        # agy rejects --effort for Claude ("not supported for model") — the
+        # per-chat effort must never leak into the argv for such models.
+        ("claude-sonnet-4-6", "high", ["--model", "claude-sonnet-4-6"]),
         ("claude-opus-4-6-thinking", "", ["--model", "claude-opus-4-6-thinking"]),
         ("gpt-oss-120b-medium", "", ["--model", "gpt-oss-120b-medium"]),
-        ("", "high", ["--effort", "high"]),
+        # Suffixed IDs reject a conflicting --effort ("conflicts with --effort=high").
+        ("gemini-3.8-flash-low", "high", ["--model", "gemini-3.8-flash-low"]),
+        # No model selected: effort alone cannot be applied safely.
+        ("", "high", []),
         ("", "", []),
     ],
 )
@@ -216,3 +223,70 @@ def test_abort_turn_when_not_running() -> None:
 
     assert abort_turn("/nonexistent/chat/dir") is False
 
+
+
+async def test_run_agy_cancellation_kills_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling run_agy must kill the child subprocess, not orphan it."""
+    import asyncio
+    import sys
+
+    import src.agy_runner as ar
+
+    procs: list[object] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def recording_exec(*args: object, **kwargs: object):
+        p = await real_exec(*args, **kwargs)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_exec)
+    monkeypatch.setattr(
+        ar, "_build_args",
+        lambda **kwargs: [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    task = asyncio.create_task(run_agy(
+        prompt="hi", chat_dir=str(tmp_path), has_session=False,
+        model="", mode="code", agy_path=sys.executable,
+    ))
+    for _ in range(100):
+        if procs:
+            break
+        await asyncio.sleep(0.02)
+    assert procs, "child process should have been spawned"
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await asyncio.sleep(0.2)
+    assert procs[0].returncode is not None, "child must be killed on cancellation"
+
+
+async def test_run_agy_captures_result_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stream-json result event carries token usage — run_agy must expose it."""
+    import sys
+
+    import src.agy_runner as ar
+
+    script = tmp_path / "fake_agy.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'event': 'result', 'result': {'status': 'SUCCESS', 'response': 'ok', "
+        "'usage': {'input_tokens': 10, 'output_tokens': 2, 'thinking_tokens': 0, "
+        "'cache_read_tokens': 0, 'total_tokens': 12}}}, sys.stdout)\n"
+        "print()\n"
+    )
+    monkeypatch.setattr(ar, "_build_args", lambda **kwargs: [sys.executable, str(script)])
+
+    res = await run_agy(
+        prompt="hi", chat_dir=str(tmp_path), has_session=False,
+        model="", mode="code", agy_path=sys.executable,
+    )
+    assert res.exit_code == 0
+    assert res.usage == {
+        "input_tokens": 10, "output_tokens": 2, "thinking_tokens": 0,
+        "cache_read_tokens": 0, "total_tokens": 12,
+    }

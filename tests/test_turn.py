@@ -76,3 +76,28 @@ async def test_execute_agy_returns_timeout_reply(monkeypatch: pytest.MonkeyPatch
     text, code = await execute_agy(tg, 42, _FakeMsg(), cs, cfg, "/usr/bin/agy")
     assert code == 124
     assert text == ""
+
+
+async def test_execute_agy_propagates_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from src.agy_runner import AgyResult
+    from src.config import AgyConfig, Config, TelegramConfig
+    from src.state import ChatState
+    from src.turn import execute_agy
+
+    async def fake_run_agy(**kwargs):
+        return AgyResult(text="ok", exit_code=0, stderr="",
+                         usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6})
+
+    monkeypatch.setattr("src.turn.run_agy", fake_run_agy)
+
+    class _TG:
+        async def send_chat_action(self, *a, **k):
+            pass
+
+    cs = ChatState(chat_dir=str(tmp_path))
+    cfg = Config(telegram=TelegramConfig(bot_token="t", allowed_user_ids=[42]),
+                 agy=AgyConfig(default_workdir="/tmp", model="", mode="code"))
+    out = await execute_agy(_TG(), 10, SimpleNamespace(text="hi"), cs, cfg, "agy")
+    assert out.usage == {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}

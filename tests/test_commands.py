@@ -359,3 +359,54 @@ async def test_queue_command_reports_real_status() -> None:
         assert "depth: 2" in reply2.text.lower()
     finally:
         _QUEUE.reset()
+async def test_model_selection_clears_incompatible_effort_callback() -> None:
+    """Picking a model that ignores effort must reset a stale effort value."""
+    cs = _state()
+    cs.model = "gemini-3.8-flash"
+    cs.effort = "high"
+    cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42,
+                       user_id=42, message_id=1, data="m:claude-sonnet-4-6")
+    handle_callback(cq, cs, _cfg())
+    assert cs.model == "claude-sonnet-4-6"
+    assert cs.effort == ""
+
+
+async def test_model_selection_keeps_effort_for_composable_base() -> None:
+    cs = _state()
+    cs.effort = "high"
+    cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42,
+                       user_id=42, message_id=1, data="m:gemini-3.8-flash")
+    handle_callback(cq, cs, _cfg())
+    assert cs.model == "gemini-3.8-flash"
+    assert cs.effort == "high"  # the launch composes gemini-3.8-flash-high
+
+
+async def test_text_model_selection_clears_incompatible_effort() -> None:
+    cs = _state()
+    cs.effort = "high"
+    reply = await handle_text_command(_FakeMsg("/model claude-sonnet-4-6"), cs, _cfg())
+    assert reply is not None
+    assert cs.model == "claude-sonnet-4-6"
+    assert cs.effort == ""
+
+
+async def test_usage_command_renders_counters() -> None:
+    import time as _time
+
+    cs = _state()
+    cs.usage_last_in, cs.usage_last_out, cs.usage_last_total = 100, 5, 105
+    cs.usage_today_tokens = 105
+    cs.usage_today_turns = 1
+    cs.usage_today_date = _time.strftime("%Y-%m-%d")
+    cs.usage_total_tokens, cs.usage_total_turns = 1234, 12
+    reply = await handle_text_command(_FakeMsg("/usage"), cs, _cfg())
+    assert reply is not None
+    assert "105" in reply.text
+    assert "1,234" in reply.text  # thousands separator formatting
+    assert "Hari ini" in reply.text
+
+
+async def test_usage_command_empty_state() -> None:
+    reply = await handle_text_command(_FakeMsg("/usage"), _state(), _cfg())
+    assert reply is not None
+    assert "Belum ada" in reply.text

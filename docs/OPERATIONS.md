@@ -187,8 +187,8 @@ systemctl --user status antigravity-telegram-bridge.service --no-pager
 ## Verify end-to-end
 
 1. From your phone, open the bot in Telegram.
-2. Send `/start` or `hello`.
-3. Within a few seconds expect the typing indicator and a `⏳` placeholder, then an `agy` reply. While a turn is running, further messages are acknowledged immediately with `⏳ Queued (position #N)` and processed in order.
+2. Send `/start` — after a restart every chat wakes up inactive, so this activates the bot.
+3. Then send a text message (e.g. `hello`). Within a few seconds expect the typing indicator and a `⏳` placeholder, then an `agy` reply. While a turn is running, further messages are acknowledged immediately with `⏳ Queued (position #N)` and processed in order.
 4. Check the log:
 
 ```sh
@@ -382,8 +382,8 @@ git push -u origin main
 4. Tag a release:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ### Pre-push checklist
