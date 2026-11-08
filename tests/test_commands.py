@@ -359,3 +359,32 @@ async def test_queue_command_reports_real_status() -> None:
         assert "depth: 2" in reply2.text.lower()
     finally:
         _QUEUE.reset()
+async def test_model_selection_clears_incompatible_effort_callback() -> None:
+    """Picking a model that ignores effort must reset a stale effort value."""
+    cs = _state()
+    cs.model = "gemini-3.8-flash"
+    cs.effort = "high"
+    cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42,
+                       user_id=42, message_id=1, data="m:claude-sonnet-4-6")
+    handle_callback(cq, cs, _cfg())
+    assert cs.model == "claude-sonnet-4-6"
+    assert cs.effort == ""
+
+
+async def test_model_selection_keeps_effort_for_composable_base() -> None:
+    cs = _state()
+    cs.effort = "high"
+    cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42,
+                       user_id=42, message_id=1, data="m:gemini-3.8-flash")
+    handle_callback(cq, cs, _cfg())
+    assert cs.model == "gemini-3.8-flash"
+    assert cs.effort == "high"  # the launch composes gemini-3.8-flash-high
+
+
+async def test_text_model_selection_clears_incompatible_effort() -> None:
+    cs = _state()
+    cs.effort = "high"
+    reply = await handle_text_command(_FakeMsg("/model claude-sonnet-4-6"), cs, _cfg())
+    assert reply is not None
+    assert cs.model == "claude-sonnet-4-6"
+    assert cs.effort == ""

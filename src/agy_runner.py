@@ -58,12 +58,31 @@ def abort_turn(chat_dir: str) -> bool:
 
 
 # Base model prefix -> (supported effort suffixes, default effort).
-# agy rejects these base IDs without an effort (e.g. "--model claude-sonnet-5-5
-# requires --effort (available: low, medium, high)"), so the bridge appends one.
+# Effort is expressed through the model ID itself: these bases get a suffix
+# appended (e.g. "gemini-3.8-flash" + "high" -> "gemini-3.8-flash-high").
 _EFFORT_SUFFIX_MODELS: dict[str, tuple[tuple[str, ...], str]] = {
     "gemini-3.8": (("low", "medium", "high"), "low"),
 }
 _EFFORT_SUFFIXES: tuple[str, ...] = ("-low", "-medium", "-high", "-max")
+
+# Model IDs that accept a standalone --effort flag at launch. None in the
+# current agy catalog: suffixed IDs reject a conflicting flag
+# ("--model gemini-3.8-flash-low conflicts with --effort=high") and Claude
+# models reject any flag ("--effort is not supported for model ...").
+# Kept as a hook for future models exposing a bare ID + --effort.
+_STANDALONE_EFFORT_MODELS: frozenset[str] = frozenset()
+
+
+def model_uses_effort(model: str) -> bool:
+    """True when cs.effort influences the launched model ID.
+
+    Only the composable bases listed in _EFFORT_SUFFIX_MODELS consume the
+    per-chat effort; IDs with a baked-in suffix or families without effort
+    support (Claude) ignore it.
+    """
+    if not model or model.endswith(_EFFORT_SUFFIXES):
+        return False
+    return any(model.startswith(prefix) for prefix in _EFFORT_SUFFIX_MODELS)
 
 
 def _resolve_model_args(model: str, effort: str) -> list[str]:
@@ -85,7 +104,9 @@ def _resolve_model_args(model: str, effort: str) -> list[str]:
     args: list[str] = []
     if model:
         args.extend(["--model", model])
-    if effort:
+    # Never emit --effort unless the model family actually accepts it: agy
+    # rejects the whole turn otherwise (verified against the live CLI).
+    if effort and model in _STANDALONE_EFFORT_MODELS:
         args.extend(["--effort", effort])
     return args
 

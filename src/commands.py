@@ -12,6 +12,7 @@ import subprocess
 from typing import TYPE_CHECKING
 import yaml
 
+from src.agy_runner import model_uses_effort
 from src.media import clean_inbox, list_inbox
 from src.queue import QUEUE
 from src.state import is_valid_model
@@ -500,6 +501,10 @@ async def handle_text_command(
         if args:
             if is_valid_model(args):
                 cs.model = args
+                # Keep effort state coherent: it only applies to models that
+                # consume it, so a stale value must not linger on Claude etc.
+                if not model_uses_effort(args):
+                    cs.effort = ""
                 return BridgeReply(f"🤖 Model set to {args}")
             return BridgeReply(f"⚠️ Unsupported model: {args}")
         return _render_model_picker(cs, cfg)
@@ -672,6 +677,8 @@ def handle_callback(
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
         elif choice in MODEL_CHOICES or is_valid_model(choice):
             cs.model = choice
+            if not model_uses_effort(choice):
+                cs.effort = ""  # stale effort would be inert on this model
             model_info = next((m for m in BASE_MODELS if m[0] == choice), None)
             if model_info and model_info[2]:
                 return _render_model_effort_picker(choice, cs, cfg, toast=f"Model: {choice}")

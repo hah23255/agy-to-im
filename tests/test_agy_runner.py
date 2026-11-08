@@ -186,8 +186,10 @@ def test_build_args_effort() -> None:
         chat_dir="/tmp/test",
         effort="high",
     )
-    assert "--effort" in args
-    assert "high" in args
+    # agy rejects a standalone --effort when no effort-capable model is
+    # selected (default model conflicts with it), so nothing may be emitted.
+    assert "--effort" not in args
+    assert "high" not in args
 
 
 @pytest.mark.parametrize(
@@ -198,10 +200,15 @@ def test_build_args_effort() -> None:
         ("gemini-3.8-flash", "high", ["--model", "gemini-3.8-flash-high"]),
         ("gemini-3.8-flash", "max", ["--model", "gemini-3.8-flash-high"]),
         ("claude-sonnet-4-6", "", ["--model", "claude-sonnet-4-6"]),
-        ("claude-sonnet-4-6", "high", ["--model", "claude-sonnet-4-6", "--effort", "high"]),
+        # agy rejects --effort for Claude ("not supported for model") — the
+        # per-chat effort must never leak into the argv for such models.
+        ("claude-sonnet-4-6", "high", ["--model", "claude-sonnet-4-6"]),
         ("claude-opus-4-6-thinking", "", ["--model", "claude-opus-4-6-thinking"]),
         ("gpt-oss-120b-medium", "", ["--model", "gpt-oss-120b-medium"]),
-        ("", "high", ["--effort", "high"]),
+        # Suffixed IDs reject a conflicting --effort ("conflicts with --effort=high").
+        ("gemini-3.8-flash-low", "high", ["--model", "gemini-3.8-flash-low"]),
+        # No model selected: effort alone cannot be applied safely.
+        ("", "high", []),
         ("", "", []),
     ],
 )
