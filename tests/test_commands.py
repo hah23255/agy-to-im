@@ -388,3 +388,25 @@ async def test_text_model_selection_clears_incompatible_effort() -> None:
     assert reply is not None
     assert cs.model == "claude-sonnet-4-6"
     assert cs.effort == ""
+
+
+async def test_usage_command_renders_counters() -> None:
+    import time as _time
+
+    cs = _state()
+    cs.usage_last_in, cs.usage_last_out, cs.usage_last_total = 100, 5, 105
+    cs.usage_today_tokens = 105
+    cs.usage_today_turns = 1
+    cs.usage_today_date = _time.strftime("%Y-%m-%d")
+    cs.usage_total_tokens, cs.usage_total_turns = 1234, 12
+    reply = await handle_text_command(_FakeMsg("/usage"), cs, _cfg())
+    assert reply is not None
+    assert "105" in reply.text
+    assert "1,234" in reply.text  # thousands separator formatting
+    assert "Hari ini" in reply.text
+
+
+async def test_usage_command_empty_state() -> None:
+    reply = await handle_text_command(_FakeMsg("/usage"), _state(), _cfg())
+    assert reply is not None
+    assert "Belum ada" in reply.text

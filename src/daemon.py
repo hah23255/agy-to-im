@@ -100,6 +100,23 @@ def _ensure_chat_state(state: State, chat_id: int, chats_root: Path) -> ChatStat
     return cs
 
 
+def _record_usage(cs: ChatState, usage: dict[str, Any]) -> None:
+    """Accumulate token usage from a stream-json result event into chat state."""
+    total = int(usage.get("total_tokens", 0) or 0)
+    today = time.strftime("%Y-%m-%d")
+    if cs.usage_today_date != today:
+        cs.usage_today_date = today
+        cs.usage_today_tokens = 0
+        cs.usage_today_turns = 0
+    cs.usage_last_in = int(usage.get("input_tokens", 0) or 0)
+    cs.usage_last_out = int(usage.get("output_tokens", 0) or 0)
+    cs.usage_last_total = total
+    cs.usage_today_tokens += total
+    cs.usage_today_turns += 1
+    cs.usage_total_tokens += total
+    cs.usage_total_turns += 1
+
+
 def _format_timeout_reply() -> str:
     minutes = AGY_TIMEOUT_S / 60
     return (
@@ -325,6 +342,14 @@ async def _do_turn(
             cs.has_session = True
         cs.turn_count += 1
         reply = text or "(empty reply)"
+    # Token accounting: the stream-json result event reports usage when the
+    # turn completed successfully.
+    usage = getattr(turn_res, "usage", None)
+    if usage and usage.get("total_tokens"):
+        try:
+            _record_usage(cs, usage)
+        except Exception:
+            pass
     # Post-turn maintenance: update OKF memory layer, clean inbox
     try:
         attach_memory(cs.chat_dir, None, bridge_version="0.2.0")

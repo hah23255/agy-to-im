@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 from typing import TYPE_CHECKING
 import yaml
 
@@ -99,6 +100,7 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "mcp", "description": "View and manage MCP servers and tools"},
     {"command": "skills", "description": "List and inspect available skills"},
     {"command": "queue", "description": "Turn queue status"},
+    {"command": "usage", "description": "Token usage for this chat"},
 ]
 
 
@@ -600,6 +602,21 @@ async def handle_text_command(
     if cmd == "/queue":
         lines = QUEUE.status()
         return BridgeReply("📋 Turn queue\n" + "\n".join(f"• {line}" for line in lines))
+    if cmd == "/usage":
+        today = time.strftime("%Y-%m-%d")
+        tokens_today = cs.usage_today_tokens if cs.usage_today_date == today else 0
+        turns_today = cs.usage_today_turns if cs.usage_today_date == today else 0
+        if not cs.usage_total_turns and not cs.usage_last_total:
+            return BridgeReply("📊 Belum ada data usage untuk chat ini.")
+        lines = ["📊 Usage agy (chat ini)"]
+        if cs.usage_last_total:
+            lines.append(
+                f"• Turn terakhir: {cs.usage_last_in:,} in / {cs.usage_last_out:,} out"
+                f" — {cs.usage_last_total:,} token"
+            )
+        lines.append(f"• Hari ini: {tokens_today:,} token ({turns_today} turn)")
+        lines.append(f"• Total: {cs.usage_total_tokens:,} token ({cs.usage_total_turns} turn)")
+        return BridgeReply("\n".join(lines))
     if cmd in ("/getfile", "/sendfile", "/download"):
         if not args:
             return BridgeReply("⚠️ Usage: /getfile <filename>")

@@ -25,11 +25,14 @@ class TurnOutput(tuple):
     code: int
     has_tools: bool
     response_mid: int | None
+    usage: dict[str, int] | None
 
-    def __new__(cls, text: str, code: int, has_tools: bool = False, response_mid: int | None = None):
+    def __new__(cls, text: str, code: int, has_tools: bool = False,
+                response_mid: int | None = None, usage: dict[str, int] | None = None):
         obj = super().__new__(cls, (text, code))
         obj.has_tools = has_tools
         obj.response_mid = response_mid
+        obj.usage = usage
         return obj
 
 
@@ -124,7 +127,7 @@ async def execute_agy(
             "turn chat=%d cwd=%s exit=%d ms=%d reply_len=%d tools=%s",
             chat_id, cs.chat_dir, result.exit_code, elapsed, len(result.text or ""), has_tools,
         )
-    return TurnOutput(result.text or "", result.exit_code, has_tools)
+    return TurnOutput(result.text or "", result.exit_code, has_tools, usage=result.usage)
 
 
 async def _heartbeat(

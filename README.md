@@ -53,6 +53,7 @@ The biggest change is architectural: **turn execution was moved out of the polli
 | Memory health gate with automatic self-restart | ✅ |
 | Zombie subprocess reaping + garbage collection | ✅ |
 | Multi-user FIFO turn queue with position feedback | ✅ |
+| Per-chat token usage tracking (`/usage`) | ✅ |
 | Webhook mode with HMAC verification | ✅ |
 | Health endpoint (`/health`) and Prometheus metrics (`/metrics`) | ✅ |
 | `systemd --user` service with hardening | ✅ |
@@ -121,6 +122,7 @@ For the full step-by-step guide see `docs/deployment.md`. Day-to-day operations 
 * `/mcp` - View and manage MCP servers and tools
 * `/skills` - List and inspect available skills
 * `/queue` - Queue status
+* `/usage` - Token usage for this chat (last turn / today / total)
 
 ### Architecture Mapping
 ```mermaid
@@ -181,6 +183,7 @@ flowchart LR
 | Монитор на активността в реално време по време на turn | ✅ |
 | Поддръжка на качване на снимки и документи | ✅ |
 | Многопотребителска FIFO опашка за изчакване с позиция | ✅ |
+| Проследяване на потреблението на токени за чат (`/usage`) | ✅ |
 | Webhook режим с HMAC верификация | ✅ |
 | Здравна точка (`/health`) и Prometheus метрики (`/metrics`) | ✅ |
 | `systemd --user` услуга със защити | ✅ |
@@ -249,6 +252,7 @@ flowchart LR
 * `/mcp` - Преглед и управление на MCP сървъри и инструменти
 * `/skills` - Списък с налични умения
 * `/queue` - Статус на опашката
+* `/usage` - Потребление на токени за този чат (последен turn / днес / общо)
 
 ### Архитектурно описание
 ```mermaid

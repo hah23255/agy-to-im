@@ -263,3 +263,30 @@ async def test_run_agy_cancellation_kills_child(tmp_path: Path, monkeypatch: pyt
         pass
     await asyncio.sleep(0.2)
     assert procs[0].returncode is not None, "child must be killed on cancellation"
+
+
+async def test_run_agy_captures_result_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stream-json result event carries token usage — run_agy must expose it."""
+    import sys
+
+    import src.agy_runner as ar
+
+    script = tmp_path / "fake_agy.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'event': 'result', 'result': {'status': 'SUCCESS', 'response': 'ok', "
+        "'usage': {'input_tokens': 10, 'output_tokens': 2, 'thinking_tokens': 0, "
+        "'cache_read_tokens': 0, 'total_tokens': 12}}}, sys.stdout)\n"
+        "print()\n"
+    )
+    monkeypatch.setattr(ar, "_build_args", lambda **kwargs: [sys.executable, str(script)])
+
+    res = await run_agy(
+        prompt="hi", chat_dir=str(tmp_path), has_session=False,
+        model="", mode="code", agy_path=sys.executable,
+    )
+    assert res.exit_code == 0
+    assert res.usage == {
+        "input_tokens": 10, "output_tokens": 2, "thinking_tokens": 0,
+        "cache_read_tokens": 0, "total_tokens": 12,
+    }

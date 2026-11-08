@@ -40,6 +40,9 @@ class AgyResult:
     text: str
     exit_code: int
     stderr: str
+    # Token usage reported by the stream-json result event (None on
+    # abort/timeout/error paths).
+    usage: dict[str, int] | None = None
 
 
 _ACTIVE_PROC: dict[str, Any] = {}
@@ -246,9 +249,10 @@ async def run_agy(
     plain_text_lines: list[str] = []
     final_response = ""
     result_error = ""
+    result_usage: dict[str, int] | None = None
 
     async def _read_stdout() -> None:
-        nonlocal final_response, result_error
+        nonlocal final_response, result_error, result_usage
         if proc.stdout is None:
             return
         async for raw_line in proc.stdout:
@@ -263,6 +267,8 @@ async def run_agy(
                         res = data.get("result", {})
                         final_response = res.get("response", "")
                         result_error = res.get("error", "")
+                        usage = res.get("usage")
+                        result_usage = usage if isinstance(usage, dict) else None
                     if on_event is not None:
                         cb_res = on_event(data)
                         if asyncio.iscoroutine(cb_res):
@@ -333,4 +339,5 @@ async def run_agy(
         text=text,
         exit_code=exit_code,
         stderr=stderr_out,
+        usage=result_usage,
     )

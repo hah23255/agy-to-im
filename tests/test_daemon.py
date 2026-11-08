@@ -693,3 +693,58 @@ async def test_turn_worker_releases_queue_when_chat_state_fails(
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
     assert q.active is False
+
+
+# ── /usage: token accounting per chat ─────────────────────────────────────
+
+
+def test_record_usage_resets_daily_window() -> None:
+    from src.daemon import _record_usage
+    from src.state import ChatState
+
+    cs = ChatState(chat_dir="/tmp/x", usage_today_date="2000-01-01",
+                   usage_today_tokens=999, usage_today_turns=9,
+                   usage_total_tokens=999, usage_total_turns=9)
+    _record_usage(cs, {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
+    assert cs.usage_today_tokens == 12  # stale day reset
+    assert cs.usage_today_turns == 1
+    assert cs.usage_total_tokens == 999 + 12
+    assert cs.usage_total_turns == 10
+    assert cs.usage_last_in == 10
+    assert cs.usage_last_out == 2
+    assert cs.usage_last_total == 12
+
+
+async def test_run_records_usage_in_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.turn import TurnOutput
+
+    async def fake_agy(*args: Any, **kwargs: Any) -> TurnOutput:
+        return TurnOutput("echo:hi", 0, usage={
+            "input_tokens": 100, "output_tokens": 5, "total_tokens": 105,
+        })
+
+    monkeypatch.setattr("src.daemon.execute_agy", fake_agy)
+
+    state_path = tmp_path / "state.json"
+    chats_root = tmp_path / "chats"
+    tg = _FakeTelegram(
+        updates_to_serve=[[_msg("hi", update_id=100)]],
+        sent_messages=[], chat_actions=[],
+    )
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.4, stop.set)
+
+    await run(
+        cfg=_cfg(), state_path=state_path, chats_root=chats_root, tg=tg,
+        agy_path="/usr/bin/true",
+        info=DaemonInfo(bot_username="@bot", started_at=0.0, agy_version="1.0"),
+        stop_event=stop,
+    )
+    persisted = load_state(state_path, chats_root)
+    cs = persisted.chats[10]
+    assert cs.usage_total_tokens == 105
+    assert cs.usage_total_turns == 1
+    assert cs.usage_last_in == 100
+    assert cs.usage_today_tokens == 105

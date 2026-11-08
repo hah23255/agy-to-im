@@ -17,6 +17,9 @@ from pathlib import Path
 # no '..'). Real chat_ids are integers, so the dir name is the stringified id.
 _CHAT_DIR_RE = re.compile(r"^-?[0-9]+$")
 
+# YYYY-MM-DD key for the per-chat daily usage window.
+_USAGE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 # Per-chat overrides have to be argv-safe. The regex rejects any character
 # that's not strictly needed for valid model identifiers (e.g. "gemini-3.5-flash").
 # Crucially it forbids a leading `-` so a tampered state file can't inject flags.
@@ -37,6 +40,15 @@ class ChatState:
     style_hint: bool = True  # toggle for Telegram specific prompt hints
     turn_count: int = 0  # successful turns served on this chat
     active: bool = True  # False → bot ignores non-command messages
+    # Token usage accounting (from agy stream-json result events).
+    usage_last_in: int = 0  # input tokens of the last completed turn
+    usage_last_out: int = 0  # output tokens of the last completed turn
+    usage_last_total: int = 0  # total tokens of the last completed turn
+    usage_today_tokens: int = 0  # tokens accumulated today (local time)
+    usage_today_turns: int = 0  # turns counted today
+    usage_today_date: str = ""  # YYYY-MM-DD window key for the daily counters
+    usage_total_tokens: int = 0  # lifetime token total for this chat
+    usage_total_turns: int = 0  # lifetime turn count for this chat
 
 
 @dataclass
@@ -75,6 +87,12 @@ def _safe_bool(raw: object) -> bool:
 
 def _safe_effort(raw: object) -> str:
     if isinstance(raw, str) and raw in _ALLOWED_EFFORTS:
+        return raw
+    return ""
+
+
+def _safe_usage_date(raw: object) -> str:
+    if isinstance(raw, str) and _USAGE_DATE_RE.match(raw):
         return raw
     return ""
 
@@ -125,6 +143,14 @@ def _safe_chat_state(
         style_hint=_safe_bool(raw.get("style_hint", True)),
         turn_count=_safe_turn_count(raw.get("turn_count", 0)),
         active=_safe_bool(raw.get("active", True)),
+        usage_last_in=_safe_turn_count(raw.get("usage_last_in", 0)),
+        usage_last_out=_safe_turn_count(raw.get("usage_last_out", 0)),
+        usage_last_total=_safe_turn_count(raw.get("usage_last_total", 0)),
+        usage_today_tokens=_safe_turn_count(raw.get("usage_today_tokens", 0)),
+        usage_today_turns=_safe_turn_count(raw.get("usage_today_turns", 0)),
+        usage_today_date=_safe_usage_date(raw.get("usage_today_date", "")),
+        usage_total_tokens=_safe_turn_count(raw.get("usage_total_tokens", 0)),
+        usage_total_turns=_safe_turn_count(raw.get("usage_total_turns", 0)),
     )
 
 
