@@ -210,12 +210,54 @@ def test_build_args_effort() -> None:
         # No model selected: effort alone cannot be applied safely.
         ("", "high", []),
         ("", "", []),
+        # Modern subscription models
+        ("gemini-4-neon", "", ["--model", "gemini-4-neon-medium"]),
+        ("gemini-4-neon", "xhigh", ["--model", "gemini-4-neon-xhigh"]),
+        ("gemini-4-neon", "max", ["--model", "gemini-4-neon-xhigh"]),
+        ("gemini-4-neon-xhigh", "low", ["--model", "gemini-4-neon-xhigh"]),
+        ("claude-opus-5-5", "", ["--model", "claude-opus-5-5-medium"]),
+        ("claude-opus-5-5", "high", ["--model", "claude-opus-5-5-high"]),
+        ("claude-sonnet-5-5", "low", ["--model", "claude-sonnet-5-5-low"]),
+        ("gemini-pro-orchestrator-neon", "high", ["--model", "gemini-pro-orchestrator-neon"]),
     ],
 )
 def test_resolve_model_args(model: str, effort: str, expected: list[str]) -> None:
     from src.agy_runner import _resolve_model_args
 
     assert _resolve_model_args(model, effort) == expected
+
+
+def test_resolve_model_args_and_uses_effort_with_live_catalog() -> None:
+    import src.agy_catalog as cat_mod
+    from src.agy_runner import _resolve_model_args, model_uses_effort
+
+    custom = cat_mod.ModelCatalog(
+        families=(
+            cat_mod.ModelFamily(
+                id="gemini-5-custom",
+                label="Gemini 5 Custom",
+                efforts=("low", "medium", "high", "max"),
+                variants=(
+                    ("low", "gemini-5-custom-low"),
+                    ("medium", "gemini-5-custom-medium"),
+                    ("high", "gemini-5-custom-high"),
+                    ("max", "gemini-5-custom-max"),
+                ),
+                default_effort="medium",
+            ),
+            cat_mod.ModelFamily(id="fixed-orch", label="Fixed Orch"),
+        ),
+        raw_models=(),
+        source="live",
+        fetched_at=9999999999.0,
+    )
+    cat_mod._CATALOG_CACHE["agy"] = custom
+
+    assert model_uses_effort("gemini-5-custom") is True
+    assert model_uses_effort("gemini-5-custom-max") is False
+    assert model_uses_effort("fixed-orch") is False
+    assert _resolve_model_args("gemini-5-custom", "max") == ["--model", "gemini-5-custom-max"]
+    assert _resolve_model_args("fixed-orch", "high") == ["--model", "fixed-orch"]
 
 
 def test_abort_turn_when_not_running() -> None:

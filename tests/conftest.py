@@ -26,6 +26,20 @@ def sample_config_dict() -> dict[str, Any]:
     }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_agy_catalog(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Keep unit tests deterministic and offline by isolating agy_catalog."""
+    import src.agy_catalog as agy_catalog
+
+    async def _disabled_runner(args: list[str], timeout: float) -> tuple[int, str, str]:
+        return 1, "", "agy subprocess disabled in unit tests"
+
+    agy_catalog.clear_caches()
+    monkeypatch.setattr(agy_catalog, "_run_agy_subprocess", _disabled_runner)
+    yield
+    agy_catalog.clear_caches()
+
+
 @pytest.fixture
 def config_file(tmp_path: Path, sample_config_dict: dict[str, Any]) -> Path:
     """Write sample_config_dict to a temp config.json and return the path."""

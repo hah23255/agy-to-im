@@ -851,3 +851,63 @@ async def test_usage_accounting_failure_logs_warning(
 
     assert any("usage accounting failed" in r.message and "disk full" in r.message
                for r in captured), "accounting failures must not be silent"
+
+
+async def test_daemon_passes_agy_path_to_catalog_and_quota_commands_and_callbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daemon must pass agy_path to /model, /usage, and async callbacks, and warm up catalog."""
+    import src.agy_catalog as cat_mod
+    import src.daemon as daemon_mod
+
+    seen_model_paths: list[str] = []
+    seen_quota_paths: list[str] = []
+
+    async def fake_fetch_models(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 20.0):
+        seen_model_paths.append(agy_path)
+        return cat_mod.build_fallback_catalog()
+
+    async def fake_fetch_quota(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 25.0):
+        seen_quota_paths.append(agy_path)
+        return cat_mod.QuotaSnapshot(
+            groups=(cat_mod.QuotaGroup(name="Gemini Models", buckets=(cat_mod.QuotaBucket("g-w", "Weekly", "weekly", 0.75),)),),
+            fetched_at=1.0,
+        )
+
+    monkeypatch.setattr("src.commands.fetch_models_catalog", fake_fetch_models)
+    monkeypatch.setattr("src.commands.fetch_quota_snapshot", fake_fetch_quota)
+    monkeypatch.setattr(daemon_mod, "fetch_models_catalog", fake_fetch_models)
+
+    tg = _FakeTelegram(
+        updates_to_serve=[
+            [_msg("/model", update_id=900)],
+            [_msg("/usage", update_id=901)],
+            [{
+                "update_id": 902,
+                "callback_query": {
+                    "id": "cb1",
+                    "from": {"id": 42, "is_bot": False, "first_name": "T"},
+                    "message": {"message_id": 1, "chat": {"id": 10, "type": "private"}},
+                    "data": "usage:refresh",
+                },
+            }],
+        ],
+        sent_messages=[],
+        chat_actions=[],
+    )
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.4, stop.set)
+
+    await run(
+        cfg=_cfg(),
+        state_path=tmp_path / "state.json",
+        chats_root=tmp_path / "chats",
+        tg=tg,
+        agy_path="/custom/bin/agy",
+        info=DaemonInfo(bot_username="@bot", started_at=0.0, agy_version="1.0"),
+        stop_event=stop,
+    )
+
+    assert "/custom/bin/agy" in seen_model_paths
+    assert seen_quota_paths.count("/custom/bin/agy") >= 2
+    assert any("Gemini Models" in text for _, text in tg.sent_messages)

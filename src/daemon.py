@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from src.agy_catalog import fetch_models_catalog
 from src.agy_runner import AgyResult, abort_turn
-from src.commands import BOT_COMMANDS, BridgeReply, handle_callback, handle_text_command
+from src.commands import BOT_COMMANDS, BridgeReply, handle_callback, handle_callback_async, handle_text_command
 from src.config import Config, load_config
 from src.health import memory_healthy, record_error, record_turn, start_server
 from src.media import build_media_prompt, clean_inbox
@@ -423,7 +424,7 @@ async def _process_text(
     cs = _ensure_chat_state(state, msg.chat_id, chats_root)
     save_state(state_path, state)
 
-    reply = await handle_text_command(msg, cs, cfg)
+    reply = await handle_text_command(msg, cs, cfg, agy_path=agy_path)
     if reply is not None:
         save_state(state_path, state)
         try:
@@ -477,6 +478,7 @@ async def _turn_worker(
 async def _process_callback(
     cq: CallbackQuery, tg: _TelegramLike, state: State,
     state_path: Path, chats_root: Path, cfg: Config, info: DaemonInfo,
+    agy_path: str = DEFAULT_AGY_BIN,
 ) -> None:
     """Handle an inline-keyboard callback query."""
     if not is_authorized(
@@ -489,7 +491,7 @@ async def _process_callback(
         return
 
     cs = _ensure_chat_state(state, cq.chat_id, chats_root)
-    reply = handle_callback(cq, cs, cfg)
+    reply = await handle_callback_async(cq, cs, cfg, agy_path=agy_path)
     save_state(state_path, state)
 
     try:
@@ -537,6 +539,17 @@ async def _register_bot_commands(tg: _TelegramLike) -> None:
         LOG.warning("Error registering bot commands: %s", err)
 
 
+async def _warmup_catalog(agy_path: str) -> None:
+    """Warm the subscription model catalog in the background on daemon startup."""
+    try:
+        cat = await fetch_models_catalog(agy_path)
+        LOG.info("model catalog warmed source=%s count=%d", cat.source, len(cat.families))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        LOG.debug("model catalog warmup failed: %s", exc)
+
+
 async def run(
     *, cfg: Config, state_path: Path, chats_root: Path,
     tg: _TelegramLike, agy_path: str, info: DaemonInfo,
@@ -561,6 +574,7 @@ async def run(
     tick = 0
     async with tg:
         await _register_bot_commands(tg)
+        warmup = asyncio.create_task(_warmup_catalog(agy_path))
         # Turns run in a dedicated worker so the polling loop below never
         # blocks on agy (which can run for up to AGY_TIMEOUT_S).
         worker = asyncio.create_task(
@@ -606,6 +620,7 @@ async def run(
                 if cq is not None:
                     await _process_callback(
                         cq, tg, state, state_path, chats_root, cfg, info,
+                        agy_path=agy_path,
                     )
                     continue
 
@@ -635,6 +650,12 @@ async def run(
         except asyncio.TimeoutError:
             pass
         finally:
+            if not warmup.done():
+                warmup.cancel()
+                try:
+                    await warmup
+                except (asyncio.CancelledError, Exception):
+                    pass
             worker.cancel()
             try:
                 # shield() so the timeout mechanism itself never waits for the

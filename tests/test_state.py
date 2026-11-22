@@ -98,3 +98,12 @@ def test_load_state_keeps_photo_enabled(tmp_path: Path) -> None:
     )
     state = load_state(p, tmp_path / "chats")
     assert state.chats[123].photo_enabled is False
+
+
+def test_save_and_load_xhigh_effort(tmp_path: Path) -> None:
+    p = tmp_path / "state.json"
+    chat_dir = str(tmp_path / "chats" / "123")
+    cs = ChatState(chat_dir=chat_dir, model="gemini-4-neon", effort="xhigh")
+    save_state(p, State(last_update_id=1, chats={123: cs}))
+    loaded = load_state(p, tmp_path / "chats")
+    assert loaded.chats[123].effort == "xhigh"

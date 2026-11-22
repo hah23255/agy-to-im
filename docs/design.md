@@ -65,6 +65,7 @@ A separate long-running Python process, run as `python -m src.daemon`, supervise
 ├── docs/                                            # design, deployment, operations, security
 └── src/
     ├── __init__.py
+    ├── agy_catalog.py                               # live subscription model catalog + quota discovery
     ├── agy_runner.py                                # build argv + spawn agy, capture plain text
     ├── commands.py                                  # slash commands + inline-keyboard callbacks
     ├── control.py                                   # plugin-tool entry: action=start|stop|status|logs|setup
@@ -216,6 +217,7 @@ End-to-end manual checks after install:
 | `src/config.py` | Parse + validate `config.json` |
 | `src/state.py` | Atomic JSON state |
 | `src/telegram.py` | Pure helpers + async `TelegramClient` |
+| `src/agy_catalog.py` | Live subscription model catalog & quota discovery |
 | `src/agy_runner.py` | Build argv and spawn `agy` |
 | `src/commands.py` | Slash commands + inline-keyboard callbacks |
 | `src/turn.py` | Per-turn execution with typing heartbeat |

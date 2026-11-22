@@ -72,12 +72,17 @@ def abort_turn(chat_dir: str) -> bool:
 # appended (e.g. "gemini-3.8-flash" + "high" -> "gemini-3.8-flash-high").
 _EFFORT_SUFFIX_MODELS: dict[str, tuple[tuple[str, ...], str]] = {
     "gemini-3.8": (("low", "medium", "high"), "low"),
+    "gemini-4-neon": (("low", "medium", "high", "xhigh"), "medium"),
+    "gemini-4-argon": (("low", "medium", "high"), "medium"),
+    "gemini-4-hydrogen": (("low", "medium", "high", "xhigh"), "medium"),
+    "claude-opus-5-5": (("low", "medium", "high"), "medium"),
+    "claude-sonnet-5-5": (("low", "medium", "high"), "medium"),
 }
-_EFFORT_SUFFIXES: tuple[str, ...] = ("-low", "-medium", "-high", "-max")
+_EFFORT_SUFFIXES: tuple[str, ...] = ("-low", "-medium", "-high", "-xhigh", "-max")
 
 # Model IDs that accept a standalone --effort flag at launch. None in the
 # current agy catalog: suffixed IDs reject a conflicting flag
-# ("--model gemini-3.8-flash-low conflicts with --effort=high") and Claude
+# ("--model gemini-3.8-flash-low conflicts with --effort=high") and fixed
 # models reject any flag ("--effort is not supported for model ...").
 # Kept as a hook for future models exposing a bare ID + --effort.
 _STANDALONE_EFFORT_MODELS: frozenset[str] = frozenset()
@@ -86,28 +91,45 @@ _STANDALONE_EFFORT_MODELS: frozenset[str] = frozenset()
 def model_uses_effort(model: str) -> bool:
     """True when cs.effort influences the launched model ID.
 
-    Only the composable bases listed in _EFFORT_SUFFIX_MODELS consume the
-    per-chat effort; IDs with a baked-in suffix or families without effort
-    support (Claude) ignore it.
+    Only composable bases (from the live subscription catalog or fallback
+    prefix table) consume the per-chat effort; IDs with a baked-in suffix or
+    fixed models without effort support ignore it.
     """
     if not model or model.endswith(_EFFORT_SUFFIXES):
         return False
+    from src.agy_catalog import get_cached_catalog
+
+    family = get_cached_catalog().find_family(model)
+    if family is not None and family.id == model:
+        return bool(family.efforts)
     return any(model.startswith(prefix) for prefix in _EFFORT_SUFFIX_MODELS)
 
 
 def _resolve_model_args(model: str, effort: str) -> list[str]:
     """Map (model, effort) to agy CLI args.
 
-    Base IDs listed in _EFFORT_SUFFIX_MODELS get an effort suffix appended;
-    unsupported efforts (e.g. "max") are clamped to the highest supported tier.
+    Composable base IDs resolve to a concrete suffixed slug (preferring the
+    live subscription catalog, with _EFFORT_SUFFIX_MODELS as fallback);
+    unsupported efforts are clamped to the highest supported tier.
     """
     if model and not model.endswith(_EFFORT_SUFFIXES):
+        from src.agy_catalog import EFFORT_ORDER, get_cached_catalog
+
+        family = get_cached_catalog().find_family(model)
+        if family is not None and family.id == model:
+            return ["--model", family.resolve_slug(effort)]
         for prefix, (supported, default) in _EFFORT_SUFFIX_MODELS.items():
             if model.startswith(prefix):
                 if not effort:
                     chosen = default
                 elif effort in supported:
                     chosen = effort
+                elif effort in EFFORT_ORDER:
+                    req_idx = EFFORT_ORDER.index(effort)
+                    candidates = [
+                        e for e in supported if e in EFFORT_ORDER and EFFORT_ORDER.index(e) <= req_idx
+                    ]
+                    chosen = candidates[-1] if candidates else supported[0]
                 else:
                     chosen = supported[-1]
                 return ["--model", f"{model}-{chosen}"]

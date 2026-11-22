@@ -217,21 +217,62 @@ async def test_callback_model_without_effort_finishes() -> None:
     assert "R" in callback_datas
 
 
-async def test_callback_claude_46_direct_selection() -> None:
+async def test_callback_fixed_model_direct_selection() -> None:
     cs = _state()
-    cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42, user_id=42, message_id=1, data="m:claude-sonnet-4-6")
+    cq = CallbackQuery(
+        update_id=1, callback_query_id="q", chat_id=42,
+        user_id=42, message_id=1, data="m:gemini-pro-orchestrator-neon",
+    )
     reply = handle_callback(cq, cs, _cfg())
-    assert cs.model == "claude-sonnet-4-6"
-    assert "Claude Sonnet 4.6" in reply.toast
+    assert cs.model == "gemini-pro-orchestrator-neon"
+    assert "Orchestrator (Neon)" in reply.toast
 
 
-async def test_model_picker_lists_claude_46() -> None:
+async def test_model_picker_lists_fallback_modern_models() -> None:
     reply = await handle_text_command(_FakeMsg("/model"), _state(), _cfg())
     assert reply is not None and reply.keyboard is not None
     labels = " ".join(btn["text"] for row in reply.keyboard for btn in row)
-    assert "Claude Sonnet 4.6" in labels
-    assert "Claude Opus 4.6" in labels
+    assert "Gemini 4 Neon" in labels
+    assert "Claude Sonnet 5.5" in labels
+    assert "Claude Opus 5.5" in labels
+    assert "Fallback catalog" in reply.text
+
+
+async def test_model_picker_uses_live_subscription_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.agy_catalog as cat_mod
+
+    live = cat_mod.ModelCatalog(
+        families=(
+            cat_mod.ModelFamily(
+                id="gemini-3.8-flash",
+                label="Gemini 3.8 Flash",
+                efforts=("low", "medium", "high"),
+                variants=(
+                    ("low", "gemini-3.8-flash-low"),
+                    ("medium", "gemini-3.8-flash-medium"),
+                    ("high", "gemini-3.8-flash-high"),
+                ),
+                default_effort="low",
+            ),
+        ),
+        raw_models=(cat_mod.ModelEntry("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),),
+        default_model_id="gemini-3.8-flash-low",
+        default_model_label="Gemini 3.8 Flash (Low)",
+        source="live",
+        fetched_at=9999999999.0,
+    )
+
+    async def fake_fetch(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 20.0):
+        return live
+
+    monkeypatch.setattr("src.commands.fetch_models_catalog", fake_fetch)
+    reply = await handle_text_command(_FakeMsg("/model"), _state(), _cfg())
+    assert reply is not None and reply.keyboard is not None
+    labels = " ".join(btn["text"] for row in reply.keyboard for btn in row)
+    assert "Gemini 3.8 Flash" in labels
     assert "Claude Sonnet 5.5" not in labels
+    assert "1 models (live)" in reply.text
+    assert "gemini-3.8-flash-low" in reply.text
 
 
 async def test_bot_commands_list_validity() -> None:
@@ -410,3 +451,158 @@ async def test_usage_command_empty_state() -> None:
     reply = await handle_text_command(_FakeMsg("/usage"), _state(), _cfg())
     assert reply is not None
     assert "Belum ada" in reply.text
+
+
+async def test_model_refresh_and_default_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.agy_catalog as cat_mod
+
+    seen_force: list[bool] = []
+    live = cat_mod.ModelCatalog(
+        families=(
+            cat_mod.ModelFamily(
+                id="gemini-4-neon",
+                label="Gemini 4 Neon",
+                efforts=("low", "medium", "high", "xhigh"),
+                variants=(
+                    ("low", "gemini-4-neon-low"),
+                    ("medium", "gemini-4-neon-medium"),
+                    ("high", "gemini-4-neon-high"),
+                    ("xhigh", "gemini-4-neon-xhigh"),
+                ),
+                default_effort="medium",
+            ),
+        ),
+        raw_models=(cat_mod.ModelEntry("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),),
+        default_model_id="gemini-4-neon-xhigh",
+        source="live",
+        fetched_at=9999999999.0,
+    )
+
+    async def fake_fetch(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 20.0):
+        seen_force.append(force_refresh)
+        return live
+
+    monkeypatch.setattr("src.commands.fetch_models_catalog", fake_fetch)
+
+    cs = _state()
+    cs.model = "gemini-4-neon"
+    rep_refresh = await handle_text_command(_FakeMsg("/model refresh"), cs, _cfg())
+    assert rep_refresh is not None
+    assert seen_force == [True]
+    assert "live" in rep_refresh.text
+
+    rep_bad = await handle_text_command(_FakeMsg("/model unknown-tier-model"), cs, _cfg())
+    assert rep_bad is not None
+    assert "not available" in rep_bad.text.lower() or "unsupported" in rep_bad.text.lower()
+
+    rep_default = await handle_text_command(_FakeMsg("/model default"), cs, _cfg())
+    assert rep_default is not None
+    assert cs.model == ""
+
+
+async def test_effort_xhigh_normalizes_suffixed_model_and_rejects_fixed() -> None:
+    cs = _state()
+    cs.model = "gemini-4-neon-low"
+    reply = await handle_text_command(_FakeMsg("/effort xhigh"), cs, _cfg())
+    assert reply is not None
+    assert cs.model == "gemini-4-neon"
+    assert cs.effort == "xhigh"
+
+    cs_fixed = _state()
+    cs_fixed.model = "gemini-pro-orchestrator-neon"
+    rep_fixed = await handle_text_command(_FakeMsg("/effort high"), cs_fixed, _cfg())
+    assert rep_fixed is not None
+    assert "fixed" in rep_fixed.text.lower() or "not adjustable" in rep_fixed.text.lower()
+
+
+async def test_usage_and_quota_commands_render_live_quota_and_html_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as _time
+    import src.agy_catalog as cat_mod
+    from src.telegram import markdown_to_telegram_html
+
+    snap = cat_mod.QuotaSnapshot(
+        groups=(
+            cat_mod.QuotaGroup(
+                name="Gemini Models",
+                description="Models within this group: Gemini 4 Neon, Gemini 3.8 Flash",
+                buckets=(
+                    cat_mod.QuotaBucket("g-5h", "Five Hour Limit Remaining", "5h", 0.84, "2099-01-01T02:00:00Z"),
+                    cat_mod.QuotaBucket("g-w", "Weekly Limit Remaining", "weekly", 0.36, "2099-01-05T00:00:00Z"),
+                ),
+            ),
+        ),
+        credits_remaining=120,
+        fetched_at=_time.time(),
+    )
+
+    async def fake_quota(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 25.0):
+        return snap
+
+    monkeypatch.setattr("src.commands.fetch_quota_snapshot", fake_quota)
+
+    cs = _state()
+    cs.usage_last_in, cs.usage_last_out, cs.usage_last_total = 100, 20, 120
+    cs.usage_today_tokens, cs.usage_today_turns = 120, 1
+    cs.usage_today_date = _time.strftime("%Y-%m-%d")
+    cs.usage_total_tokens, cs.usage_total_turns = 500, 4
+
+    for cmd in ("/usage", "/quota"):
+        reply = await handle_text_command(_FakeMsg(cmd), cs, _cfg())
+        assert reply is not None
+        assert "Gemini Models" in reply.text
+        assert "84%" in reply.text
+        assert "36%" in reply.text
+        assert "120" in reply.text
+        assert reply.keyboard is not None
+        cbs = [btn["callback_data"] for row in reply.keyboard for btn in row]
+        assert "usage:refresh" in cbs
+        html_out = markdown_to_telegram_html(reply.text)
+        assert "Gemini Models" in html_out
+
+
+async def test_handle_callback_async_refreshes_models_and_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as _time
+    import src.agy_catalog as cat_mod
+    from src.commands import handle_callback_async
+
+    live = cat_mod.ModelCatalog(
+        families=(cat_mod.ModelFamily(id="gemini-4-neon", label="Gemini 4 Neon", efforts=("low", "xhigh"), variants=(("low", "gemini-4-neon-low"), ("xhigh", "gemini-4-neon-xhigh")), default_effort="low"),),
+        raw_models=(),
+        source="live",
+        fetched_at=_time.time(),
+    )
+    snap = cat_mod.QuotaSnapshot(
+        groups=(cat_mod.QuotaGroup(name="Gemini Models", buckets=(cat_mod.QuotaBucket("g-w", "Weekly", "weekly", 0.5),)),),
+        fetched_at=_time.time(),
+    )
+
+    async def fake_models(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 20.0):
+        return live
+
+    async def fake_quota(agy_path: str = "agy", *, force_refresh: bool = False, timeout: float = 25.0):
+        return snap
+
+    monkeypatch.setattr("src.commands.fetch_models_catalog", fake_models)
+    monkeypatch.setattr("src.commands.fetch_quota_snapshot", fake_quota)
+
+    cq_m = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42, user_id=42, message_id=1, data="model:refresh")
+    rep_m = await handle_callback_async(cq_m, _state(), _cfg(), agy_path="/custom/agy")
+    assert "1 models (live)" in rep_m.text
+    assert "refreshed" in rep_m.toast.lower()
+
+    cq_u = CallbackQuery(update_id=2, callback_query_id="q", chat_id=42, user_id=42, message_id=1, data="usage:refresh")
+    rep_u = await handle_callback_async(cq_u, _state(), _cfg(), agy_path="/custom/agy")
+    assert "Gemini Models" in rep_u.text
+    assert "50%" in rep_u.text
+    assert "refreshed" in rep_u.toast.lower()
+
+
+async def test_settings_keyboard_includes_usage_button() -> None:
+    reply = await handle_text_command(_FakeMsg("/settings"), _state(), _cfg())
+    assert reply is not None and reply.keyboard is not None
+    cbs = [btn["callback_data"] for row in reply.keyboard for btn in row]
+    assert "nav:usage" in cbs

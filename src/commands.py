@@ -13,6 +13,19 @@ import time
 from typing import TYPE_CHECKING
 import yaml
 
+from src.agy_catalog import (
+    EFFORT_LABELS,
+    EFFORT_ORDER,
+    ModelCatalog,
+    QuotaSnapshot,
+    build_fallback_catalog,
+    fetch_models_catalog,
+    fetch_quota_snapshot,
+    format_reset_countdown,
+    get_cached_catalog,
+    get_cached_quota,
+    render_progress_bar,
+)
 from src.agy_runner import model_uses_effort
 from src.media import clean_inbox, list_inbox
 from src.queue import QUEUE
@@ -27,31 +40,26 @@ if TYPE_CHECKING:
 
 DEFAULT_MODEL = "gemini-3.8-flash-low"
 
+_FALLBACK_CATALOG = build_fallback_catalog()
+
 # (model_id, display_name, supported_efforts)
-BASE_MODELS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("gemini-3.8-flash", "Gemini 3.8 Flash", ("low", "medium", "high")),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)", ()),
-    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", ()),
-    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", ()),
+BASE_MODELS: tuple[tuple[str, str, tuple[str, ...]], ...] = tuple(
+    (fam.id, fam.label, fam.efforts) for fam in _FALLBACK_CATALOG.families
 )
 
-MODEL_CHOICES: tuple[str, ...] = tuple(m[0] for m in BASE_MODELS) + (
-    "gemini-3.8-flash-high",
-    "gemini-3.8-flash-medium",
-    "gemini-3.8-flash-low",
-)
+MODEL_CHOICES: tuple[str, ...] = tuple(sorted(_FALLBACK_CATALOG.all_valid_ids()))
 MODE_CHOICES: tuple[tuple[str, str], ...] = (
     ("code", "Code (auto)"),
     ("plan", "Plan (read-only sandbox)"),
 )
-EFFORT_CHOICES: tuple[str, ...] = ("low", "medium", "high", "max")
+EFFORT_CHOICES: tuple[str, ...] = EFFORT_ORDER
 _DEFAULT_TOKEN = "_DEFAULT"
 
 WELCOME_TEXT = (
     "👋 Welcome! I'm your Antigravity bridge bot.\n\n"
     "Send me any message and I'll forward it to the agy CLI. "
     "Each chat has its own session that persists across messages.\n\n"
-    "Commands: /start · /help · /status · /settings · /model · /mode · /effort · /cd · /pwd · /stop · /reset · /getfile · /mcp · /skills"
+    "Commands: /start · /help · /status · /settings · /model · /mode · /effort · /usage · /cd · /pwd · /stop · /reset · /getfile · /mcp · /skills"
 )
 
 HELP_TEXT = (
@@ -60,9 +68,10 @@ HELP_TEXT = (
     "Commands:\n"
     "/status   — read-only system + chat summary\n"
     "/settings — control panel with buttons\n"
-    "/model    — pick a model (per-chat override)\n"
+    "/model [id|refresh|default] — pick subscription model\n"
     "/mode     — pick a mode (Code or Plan)\n"
-    "/effort   — pick reasoning effort (low/med/high/max)\n"
+    "/effort   — pick reasoning effort (low/med/high/xhigh/max)\n"
+    "/usage, /quota — live subscription quota, AI credits & chat tokens\n"
     "/pwd      — show current working directory\n"
     "/cd <dir> — change working directory for this chat\n"
     "/getfile <file> — download a file from workspace\n"
@@ -85,9 +94,9 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "help", "description": "Show available commands and usage"},
     {"command": "status", "description": "System, model, mode, and session summary"},
     {"command": "settings", "description": "Interactive settings panel"},
-    {"command": "model", "description": "Select or view model override"},
+    {"command": "model", "description": "Select subscription model or refresh catalog"},
     {"command": "mode", "description": "Switch between Code and Plan mode"},
-    {"command": "effort", "description": "Set reasoning effort (low/med/high/max)"},
+    {"command": "effort", "description": "Set reasoning effort (low/med/high/xhigh/max)"},
     {"command": "pwd", "description": "Show current working directory"},
     {"command": "cd", "description": "Change working directory for this chat"},
     {"command": "on", "description": "Activate bot (respond to messages)"},
@@ -100,7 +109,8 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "mcp", "description": "View and manage MCP servers and tools"},
     {"command": "skills", "description": "List and inspect available skills"},
     {"command": "queue", "description": "Turn queue status"},
-    {"command": "usage", "description": "Token usage for this chat"},
+    {"command": "usage", "description": "Subscription quota, AI credits & chat usage"},
+    {"command": "quota", "description": "Alias for /usage (subscription quota & credits)"},
 ]
 
 
@@ -114,12 +124,19 @@ class BridgeReply:
     document_path: Path | None = None
 
 
-def _effective_model(cs: "ChatState", cfg: "Config") -> tuple[str, str]:
-    """Return the chat's model override or the config default."""
+def _effective_model(
+    cs: "ChatState",
+    cfg: "Config",
+    catalog: ModelCatalog | None = None,
+) -> tuple[str, str]:
+    """Return the chat's model override, config default, or CLI subscription default."""
     if cs.model:
         return cs.model, "chat"
     if cfg.agy.model:
         return cfg.agy.model, "config"
+    cat = catalog or get_cached_catalog()
+    if cat.default_model_id:
+        return cat.default_model_id, "agy default"
     return DEFAULT_MODEL, "default"
 
 
@@ -130,9 +147,13 @@ def _effective_mode(cs: "ChatState", cfg: "Config") -> tuple[str, str]:
     return cfg.agy.mode, "config"
 
 
-def render_status(cs: "ChatState", cfg: "Config") -> str:
+def render_status(
+    cs: "ChatState",
+    cfg: "Config",
+    catalog: ModelCatalog | None = None,
+) -> str:
     """Render the /status summary for a chat."""
-    model, model_src = _effective_model(cs, cfg)
+    model, model_src = _effective_model(cs, cfg, catalog)
     mode, mode_src = _effective_mode(cs, cfg)
     effort = getattr(cs, "effort", "") or "default"
     session = "active (resumes next turn)" if cs.has_session else "fresh (next turn starts new)"
@@ -163,31 +184,44 @@ def _settings_keyboard(cs: "ChatState") -> InlineKeyboard:
         ],
         [
             {"text": "⚡ Change effort", "callback_data": "nav:effort"},
-            {"text": "🧹 Reset session", "callback_data": "R"},
+            {"text": "📊 Usage & Quota", "callback_data": "nav:usage"},
         ],
         [
             {"text": "🔌 MCP Servers", "callback_data": "nav:mcp"},
             {"text": "🧠 Skills", "callback_data": "nav:skills"},
         ],
         [
+            {"text": "🧹 Reset session", "callback_data": "R"},
             {"text": power_label, "callback_data": "power:toggle"},
+        ],
+        [
             {"text": "🔄 Refresh", "callback_data": "nav:settings"},
         ],
     ]
 
 
-def _model_keyboard(current_per_chat: str) -> InlineKeyboard:
-    """Build the inline keyboard listing selectable models."""
+def _model_keyboard(
+    current_per_chat: str,
+    catalog: ModelCatalog | None = None,
+) -> InlineKeyboard:
+    """Build the inline keyboard listing subscription-available models."""
+    cat = catalog or get_cached_catalog()
     rows: InlineKeyboard = []
-    for model_id, label, _ in BASE_MODELS:
-        is_active = (current_per_chat == model_id) or current_per_chat.startswith(f"{model_id}-")
+    for fam in cat.families:
+        cb = f"m:{fam.id}"
+        if len(cb.encode("utf-8")) > 64:
+            continue
+        is_active = fam.matches_model(current_per_chat)
         marker = "● " if is_active else "○ "
-        rows.append([{"text": f"{marker}{label}", "callback_data": f"m:{model_id}"}])
+        rows.append([{"text": f"{marker}{fam.label}", "callback_data": cb}])
     default_marker = "● " if not current_per_chat else "○ "
     rows.append([
-        {"text": default_marker + "Use config default", "callback_data": f"m:{_DEFAULT_TOKEN}"}
+        {"text": default_marker + "Use agy/config default", "callback_data": f"m:{_DEFAULT_TOKEN}"}
     ])
-    rows.append([{"text": "← Back to settings", "callback_data": "nav:settings"}])
+    rows.append([
+        {"text": "🔄 Refresh models", "callback_data": "model:refresh"},
+        {"text": "← Back to settings", "callback_data": "nav:settings"},
+    ])
     return rows
 
 
@@ -196,7 +230,8 @@ def _model_effort_keyboard(current_effort: str, supported_efforts: tuple[str, ..
     cells: list[dict[str, object]] = []
     for val in supported_efforts:
         marker = "● " if val == current_effort else "○ "
-        cells.append({"text": f"{marker}{val.capitalize()}", "callback_data": f"e:{val}"})
+        label = EFFORT_LABELS.get(val, val.capitalize())
+        cells.append({"text": f"{marker}{label}", "callback_data": f"e:{val}"})
 
     rows: InlineKeyboard = []
     if cells:
@@ -215,16 +250,17 @@ def _render_model_effort_picker(
     cs: "ChatState",
     cfg: "Config",
     toast: str = "",
+    catalog: ModelCatalog | None = None,
 ) -> BridgeReply:
     """Render the effort sub-picker for a composable model base."""
-    label = model_id
-    efforts: tuple[str, ...] = EFFORT_CHOICES
-    for mid, mlabel, mefforts in BASE_MODELS:
-        if mid == model_id:
-            label = mlabel
-            if mefforts:
-                efforts = mefforts
-            break
+    cat = catalog or get_cached_catalog()
+    family = cat.find_family(model_id)
+    if family is not None:
+        label = family.label
+        efforts = family.efforts or EFFORT_CHOICES
+    else:
+        label = model_id
+        efforts = EFFORT_CHOICES
     cur_effort = getattr(cs, "effort", "") or "default"
     return BridgeReply(
         text=f"⚡ Choose reasoning effort for {label}\n\nModel: {model_id}\nCurrent effort: {cur_effort}",
@@ -247,12 +283,16 @@ def _mode_keyboard(current_per_chat: str) -> InlineKeyboard:
     ]
 
 
-def _effort_keyboard(current_per_chat: str) -> InlineKeyboard:
+def _effort_keyboard(
+    current_per_chat: str,
+    supported_efforts: tuple[str, ...] = EFFORT_CHOICES,
+) -> InlineKeyboard:
     """Build the inline keyboard for effort selection."""
     cells: list[dict[str, object]] = []
-    for val in EFFORT_CHOICES:
+    for val in supported_efforts:
         marker = "● " if val == current_per_chat else "○ "
-        cells.append({"text": marker + val.capitalize(), "callback_data": f"e:{val}"})
+        label = EFFORT_LABELS.get(val, val.capitalize())
+        cells.append({"text": marker + label, "callback_data": f"e:{val}"})
     default_marker = "● " if not current_per_chat else "○ "
     return [
         cells,
@@ -266,12 +306,34 @@ def _render_settings(cs: "ChatState", cfg: "Config") -> BridgeReply:
     return BridgeReply(text=render_status(cs, cfg), keyboard=_settings_keyboard(cs))
 
 
-def _render_model_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
-    """Render the model picker reply."""
-    cur, src = _effective_model(cs, cfg)
+def _render_model_picker(
+    cs: "ChatState",
+    cfg: "Config",
+    catalog: ModelCatalog | None = None,
+    *,
+    toast: str = "",
+) -> BridgeReply:
+    """Render the subscription-aware model picker reply."""
+    cat = catalog or get_cached_catalog()
+    cur, src = _effective_model(cs, cfg, cat)
+    if cat.source == "live":
+        src_line = f"Subscription catalog: {len(cat.families)} models (live)"
+    else:
+        src_line = "Fallback catalog (live agy models unavailable — tap Refresh)"
+
+    lines = [
+        "🤖 Choose a model for this chat",
+        "",
+        f"Current: {cur}  [{src}]",
+        src_line,
+    ]
+    if cs.model and cat.source == "live" and cs.model not in cat.all_valid_ids():
+        lines.append(f"⚠️ '{cs.model}' is not in your active subscription catalog.")
+
     return BridgeReply(
-        text=f"🤖 Choose a model for this chat\n\nCurrent: {cur}  [{src}]",
-        keyboard=_model_keyboard(cs.model),
+        text="\n".join(lines),
+        keyboard=_model_keyboard(cs.model, cat),
+        toast=toast,
     )
 
 
@@ -284,13 +346,111 @@ def _render_mode_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
     )
 
 
-def _render_effort_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
-    """Render the effort picker reply."""
+def _render_effort_picker(
+    cs: "ChatState",
+    cfg: "Config",
+    catalog: ModelCatalog | None = None,
+) -> BridgeReply:
+    """Render the effort picker reply, scoped to the active model's capabilities."""
+    cat = catalog or get_cached_catalog()
+    active_model, _ = _effective_model(cs, cfg, cat)
+    family = cat.find_family(active_model)
     cur = getattr(cs, "effort", "") or "default"
+
+    if family is not None and not family.efforts:
+        return BridgeReply(
+            text=(
+                f"⚡ Reasoning effort is fixed for {family.label} ({family.id}).\n\n"
+                "This model does not support adjustable effort levels."
+            ),
+            keyboard=[
+                [{"text": "🤖 Change model", "callback_data": "nav:model"}],
+                [{"text": "← Back to settings", "callback_data": "nav:settings"}],
+            ],
+        )
+
+    efforts = family.efforts if (family is not None and family.efforts) else EFFORT_CHOICES
     return BridgeReply(
-        text=f"⚡ Choose reasoning effort for this chat\n\nCurrent: {cur}",
-        keyboard=_effort_keyboard(getattr(cs, "effort", "")),
+        text=f"⚡ Choose reasoning effort for this chat\n\nModel: {active_model}\nCurrent: {cur}",
+        keyboard=_effort_keyboard(getattr(cs, "effort", ""), efforts),
     )
+
+
+def _render_usage_reply(
+    cs: "ChatState",
+    quota: QuotaSnapshot | None = None,
+    *,
+    toast: str = "",
+) -> BridgeReply:
+    """Render live subscription quota, AI credits, and per-chat token usage."""
+    keyboard: InlineKeyboard = [
+        [
+            {"text": "🔄 Refresh quota", "callback_data": "usage:refresh"},
+            {"text": "🤖 Change model", "callback_data": "nav:model"},
+        ],
+        [{"text": "← Back to settings", "callback_data": "nav:settings"}],
+    ]
+
+    today = time.strftime("%Y-%m-%d")
+    tokens_today = cs.usage_today_tokens if cs.usage_today_date == today else 0
+    turns_today = cs.usage_today_turns if cs.usage_today_date == today else 0
+
+    if quota is not None and quota.groups:
+        lines = ["📊 Subscription Quota & Usage"]
+        for grp in quota.groups:
+            lines.append("")
+            lines.append(f"🔹 {grp.name}")
+            desc = grp.description.strip()
+            if desc.lower().startswith("models within this group:"):
+                lines.append(f"  {desc}")
+            for b in grp.buckets:
+                pct = round(b.remaining_fraction * 100)
+                bar = render_progress_bar(b.remaining_fraction)
+                if b.window == "5h":
+                    label = "5-Hour"
+                elif b.window == "weekly":
+                    label = "Weekly"
+                else:
+                    label = b.name
+                countdown = format_reset_countdown(b.reset_time)
+                reset_str = f" (reset {countdown})" if countdown else ""
+                lines.append(f"• {label}: [{bar}] {pct}%{reset_str}")
+
+        if quota.credits_remaining is not None:
+            lines.append("")
+            lines.append(f"💳 AI Credits: {quota.credits_remaining}")
+
+        lines.append("")
+        lines.append("💬 Token Usage (chat ini)")
+        if not cs.usage_total_turns and not cs.usage_last_total:
+            lines.append("• Belum ada data token untuk chat ini.")
+        else:
+            if cs.usage_last_total:
+                lines.append(
+                    f"• Turn terakhir: {cs.usage_last_in:,} in / {cs.usage_last_out:,} out"
+                    f" — {cs.usage_last_total:,} token"
+                )
+            lines.append(f"• Hari ini: {tokens_today:,} token ({turns_today} turn)")
+            lines.append(f"• Total: {cs.usage_total_tokens:,} token ({cs.usage_total_turns} turn)")
+        return BridgeReply("\n".join(lines), keyboard=keyboard, toast=toast)
+
+    if not cs.usage_total_turns and not cs.usage_last_total:
+        msg = "📊 Belum ada data usage untuk chat ini."
+        if quota is not None and quota.error:
+            msg += f"\n\n⚠️ Quota langganan tidak tersedia ({quota.error})."
+        return BridgeReply(msg, keyboard=keyboard, toast=toast)
+
+    lines = ["📊 Usage agy (chat ini)"]
+    if cs.usage_last_total:
+        lines.append(
+            f"• Turn terakhir: {cs.usage_last_in:,} in / {cs.usage_last_out:,} out"
+            f" — {cs.usage_last_total:,} token"
+        )
+    lines.append(f"• Hari ini: {tokens_today:,} token ({turns_today} turn)")
+    lines.append(f"• Total: {cs.usage_total_tokens:,} token ({cs.usage_total_turns} turn)")
+    if quota is not None and quota.error:
+        lines.append(f"\n⚠️ Quota langganan tidak tersedia ({quota.error}).")
+    return BridgeReply("\n".join(lines), keyboard=keyboard, toast=toast)
 
 
 def _list_mcp_servers() -> list[dict[str, str]]:
@@ -494,6 +654,8 @@ async def handle_text_command(
     msg: "InboundMessage",
     cs: "ChatState",
     cfg: "Config",
+    *,
+    agy_path: str = "agy",
 ) -> BridgeReply | None:
     """Return a reply for a slash command, else None (forward to agy)."""
     stripped = msg.text.strip()
@@ -515,16 +677,35 @@ async def handle_text_command(
     if cmd == "/settings":
         return _render_settings(cs, cfg)
     if cmd == "/model":
-        if args:
-            if is_valid_model(args):
-                cs.model = args
-                # Keep effort state coherent: it only applies to models that
-                # consume it, so a stale value must not linger on Claude etc.
-                if not model_uses_effort(args):
+        arg = args.strip()
+        if arg:
+            low_arg = arg.lower()
+            if low_arg == "refresh":
+                catalog = await fetch_models_catalog(agy_path, force_refresh=True)
+                return _render_model_picker(cs, cfg, catalog)
+            if low_arg in ("default", "reset"):
+                cs.model = ""
+                return BridgeReply("🤖 Model reset to default.")
+            if not is_valid_model(arg):
+                return BridgeReply(f"⚠️ Unsupported model: {arg}")
+            catalog = await fetch_models_catalog(agy_path)
+            if catalog.source == "live" and arg not in catalog.all_valid_ids():
+                return BridgeReply(
+                    f"⚠️ Model '{arg}' is not available in your active subscription.\n"
+                    "Use /model to view available models."
+                )
+            cs.model = arg
+            # Keep effort state coherent: it only applies to models that
+            # consume it, so a stale value must not linger on fixed models.
+            if not model_uses_effort(arg):
+                cs.effort = ""
+            else:
+                fam = catalog.find_family(arg)
+                if fam is not None and fam.efforts and cs.effort and cs.effort not in fam.efforts:
                     cs.effort = ""
-                return BridgeReply(f"🤖 Model set to {args}")
-            return BridgeReply(f"⚠️ Unsupported model: {args}")
-        return _render_model_picker(cs, cfg)
+            return BridgeReply(f"🤖 Model set to {arg}")
+        catalog = await fetch_models_catalog(agy_path)
+        return _render_model_picker(cs, cfg, catalog)
     if cmd == "/mode":
         if args:
             if args in {"code", "plan"}:
@@ -557,16 +738,33 @@ async def handle_text_command(
             f"✅ Switched working directory to:\n{pretty}\n\n(A new session has been started for this workspace.)"
         )
     if cmd == "/effort":
+        catalog = get_cached_catalog(agy_path)
         if args:
             val = args.strip().lower()
             if val in ("reset", "default", "auto", "off"):
                 cs.effort = ""
                 return BridgeReply("⚡ Reasoning effort reset to default.")
             if val in EFFORT_CHOICES:
+                active_model, _ = _effective_model(cs, cfg, catalog)
+                fam = catalog.find_family(active_model)
+                if fam is not None:
+                    if not fam.efforts:
+                        return BridgeReply(
+                            f"⚠️ Effort is fixed (not adjustable) for {fam.label} ({fam.id})."
+                        )
+                    if val not in fam.efforts:
+                        avail = ", ".join(fam.efforts)
+                        return BridgeReply(
+                            f"⚠️ {fam.label} does not support '{val}'. Available: {avail}."
+                        )
+                    if cs.model and cs.model != fam.id and cs.model in fam.variant_slugs():
+                        cs.model = fam.id
                 cs.effort = val
                 return BridgeReply(f"⚡ Reasoning effort set to {val}.")
-            return BridgeReply(f"⚠️ Unsupported effort: {args}. Choose: low, medium, high, max, or default.")
-        return _render_effort_picker(cs, cfg)
+            return BridgeReply(
+                f"⚠️ Unsupported effort: {args}. Choose: low, medium, high, xhigh, max, or default."
+            )
+        return _render_effort_picker(cs, cfg, catalog)
     if cmd in ("/stop", "/abort"):
         from src.agy_runner import abort_turn
         if abort_turn(cs.chat_dir):
@@ -617,21 +815,9 @@ async def handle_text_command(
     if cmd == "/queue":
         lines = QUEUE.status()
         return BridgeReply("📋 Turn queue\n" + "\n".join(f"• {line}" for line in lines))
-    if cmd == "/usage":
-        today = time.strftime("%Y-%m-%d")
-        tokens_today = cs.usage_today_tokens if cs.usage_today_date == today else 0
-        turns_today = cs.usage_today_turns if cs.usage_today_date == today else 0
-        if not cs.usage_total_turns and not cs.usage_last_total:
-            return BridgeReply("📊 Belum ada data usage untuk chat ini.")
-        lines = ["📊 Usage agy (chat ini)"]
-        if cs.usage_last_total:
-            lines.append(
-                f"• Turn terakhir: {cs.usage_last_in:,} in / {cs.usage_last_out:,} out"
-                f" — {cs.usage_last_total:,} token"
-            )
-        lines.append(f"• Hari ini: {tokens_today:,} token ({turns_today} turn)")
-        lines.append(f"• Total: {cs.usage_total_tokens:,} token ({cs.usage_total_turns} turn)")
-        return BridgeReply("\n".join(lines))
+    if cmd in ("/usage", "/quota"):
+        quota = await fetch_quota_snapshot(agy_path, force_refresh=True)
+        return _render_usage_reply(cs, quota)
     if cmd in ("/getfile", "/sendfile", "/download"):
         if not args:
             return BridgeReply("⚠️ Usage: /getfile <filename>")
@@ -667,6 +853,32 @@ async def handle_text_command(
     return None
 
 
+async def handle_callback_async(
+    cq: "CallbackQuery",
+    cs: "ChatState",
+    cfg: "Config",
+    *,
+    agy_path: str = "agy",
+) -> BridgeReply:
+    """Handle inline-keyboard callbacks with live async catalog/quota lookups."""
+    data = cq.data
+    if data == "nav:model":
+        catalog = await fetch_models_catalog(agy_path)
+        return _render_model_picker(cs, cfg, catalog)
+    if data == "model:refresh":
+        catalog = await fetch_models_catalog(agy_path, force_refresh=True)
+        toast = "Models refreshed" if catalog.source == "live" else "Using fallback catalog"
+        return _render_model_picker(cs, cfg, catalog, toast=toast)
+    if data == "nav:usage":
+        quota = await fetch_quota_snapshot(agy_path, force_refresh=False)
+        return _render_usage_reply(cs, quota)
+    if data == "usage:refresh":
+        quota = await fetch_quota_snapshot(agy_path, force_refresh=True)
+        toast = "Quota refreshed" if not quota.error else "Quota unavailable"
+        return _render_usage_reply(cs, quota, toast=toast)
+    return handle_callback(cq, cs, cfg)
+
+
 def handle_callback(
     cq: "CallbackQuery",
     cs: "ChatState",
@@ -681,6 +893,12 @@ def handle_callback(
         return _render_settings(cs, cfg)
     if data == "nav:model":
         return _render_model_picker(cs, cfg)
+    if data == "model:refresh":
+        return _render_model_picker(cs, cfg, toast="Cached catalog shown")
+    if data == "nav:usage":
+        return _render_usage_reply(cs, get_cached_quota())
+    if data == "usage:refresh":
+        return _render_usage_reply(cs, get_cached_quota(), toast="Cached quota shown")
     if data == "nav:mode":
         return _render_mode_picker(cs, cfg)
     if data == "nav:effort":
@@ -707,14 +925,19 @@ def handle_callback(
             toast = "Using config default"
             rep = _render_settings(cs, cfg)
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
-        elif choice in MODEL_CHOICES or is_valid_model(choice):
+        catalog = get_cached_catalog()
+        if choice in catalog.all_valid_ids() or choice in MODEL_CHOICES or is_valid_model(choice):
             cs.model = choice
             if not model_uses_effort(choice):
                 cs.effort = ""  # stale effort would be inert on this model
-            model_info = next((m for m in BASE_MODELS if m[0] == choice), None)
-            if model_info and model_info[2]:
-                return _render_model_effort_picker(choice, cs, cfg, toast=f"Model: {choice}")
-            label = model_info[1] if model_info else choice
+            family = catalog.find_family(choice)
+            if family is not None and family.efforts:
+                if cs.effort and cs.effort not in family.efforts:
+                    cs.effort = ""
+                return _render_model_effort_picker(
+                    choice, cs, cfg, toast=f"Model: {choice}", catalog=catalog,
+                )
+            label = family.label if family is not None else choice
             toast = f"Model: {label}"
             rep = _render_settings(cs, cfg)
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
@@ -743,8 +966,16 @@ def handle_callback(
             cs.effort = ""
             toast = "Using default effort"
         elif choice in EFFORT_CHOICES:
-            cs.effort = choice
-            toast = f"Effort: {choice}"
+            catalog = get_cached_catalog()
+            active_model, _ = _effective_model(cs, cfg, catalog)
+            fam = catalog.find_family(active_model)
+            if fam is not None and fam.efforts and choice not in fam.efforts:
+                toast = f"Unsupported effort for {fam.label}"
+            else:
+                if fam is not None and cs.model and cs.model in fam.variant_slugs():
+                    cs.model = fam.id
+                cs.effort = choice
+                toast = f"Effort: {choice}"
         else:
             toast = "Unknown choice"
         rep = _render_settings(cs, cfg)

@@ -26,7 +26,7 @@ _USAGE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _MODEL_RE = re.compile(r"^[a-zA-Z0-9._][a-zA-Z0-9._\-]*$")
 
 _ALLOWED_MODES = frozenset({"", "code", "plan"})
-_ALLOWED_EFFORTS = frozenset({"", "low", "medium", "high", "max"})
+_ALLOWED_EFFORTS = frozenset({"", "low", "medium", "high", "xhigh", "max"})
 
 
 @dataclass
@@ -35,7 +35,7 @@ class ChatState:
     has_session: bool = False  # True after first successful agy turn
     model: str = ""  # "" → use cfg.agy.model
     mode: str = ""  # "" → use cfg.agy.mode; values: "code" | "plan"
-    effort: str = ""  # "" → default; values: "low" | "medium" | "high" | "max"
+    effort: str = ""  # "" → default; values: "low" | "medium" | "high" | "xhigh" | "max"
     photo_enabled: bool = True  # toggle for photo processing
     style_hint: bool = True  # toggle for Telegram specific prompt hints
     turn_count: int = 0  # successful turns served on this chat
